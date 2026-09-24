@@ -1,0 +1,12 @@
+name = "crdt-relay"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[[durable_objects.bindings]]
+name = "DOCUMENT_DO"
+class_name = "DocumentDO"
+
+# Free tier: Durable Objects must be SQLite-backed.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DocumentDO"]
