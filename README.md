@@ -18,6 +18,14 @@ relayed through a Cloudflare Durable Object, verified with a deterministic seede
 pnpm install
 pnpm test        # vitest across all packages
 pnpm typecheck   # tsc --noEmit across all packages
+pnpm demo:lww -- --seed 42   # 3 replicas, random writes + gossip, asserts convergence
 ```
 
 No global pnpm? `corepack pnpm <cmd>` works (the version is pinned via `packageManager`).
+
+## Determinism rule
+
+`crdt-core/src` and `sim/src` may not read clocks, use ambient randomness, or schedule timers.
+All randomness goes through an explicitly passed `Prng` (mulberry32). `crdt-core/test/determinism-guard.test.ts`
+scans both source trees and fails the build on `Math.random`, `Date.now`/`new Date`, `performance.now`,
+`crypto.getRandomValues`/`randomUUID`, `process.hrtime`, or `setTimeout`/`setInterval`.

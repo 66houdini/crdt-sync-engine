@@ -4,7 +4,8 @@
   "packageManager": "pnpm@9.15.0",
   "scripts": {
     "test": "pnpm -r --if-present test",
-    "typecheck": "pnpm -r --if-present typecheck"
+    "typecheck": "pnpm -r --if-present typecheck",
+    "demo:lww": "pnpm --filter @crdt/core demo:lww"
   },
   "engines": {
     "node": ">=20"
