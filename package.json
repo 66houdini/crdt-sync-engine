@@ -5,7 +5,9 @@
   "scripts": {
     "test": "pnpm -r --if-present test",
     "typecheck": "pnpm -r --if-present typecheck",
-    "demo:lww": "pnpm --filter @crdt/core demo:lww"
+    "demo:lww": "pnpm --filter @crdt/core demo:lww",
+    "sim": "pnpm --filter @crdt/sim sim",
+    "sim:fuzz": "pnpm --filter @crdt/sim sim:fuzz"
   },
   "engines": {
     "node": ">=20"

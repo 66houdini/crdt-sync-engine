@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - name: Unit, property and relay tests
+        run: pnpm test
+      # A convergence violation prints the failing seed and fails the build.
+      # Reproduce locally with: pnpm sim --seed <seed> --trace
+      - name: Convergence fuzz, FugueMax (2000 seeds)
+        run: pnpm sim:fuzz --seeds 2000
+      - name: Convergence fuzz, RGA baseline (500 seeds)
+        run: pnpm sim:fuzz --crdt rga --seeds 500
+      - name: Worker bundles
+        run: pnpm --filter @crdt/relay-worker build:check

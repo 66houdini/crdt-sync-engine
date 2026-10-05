@@ -6,14 +6,18 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "test": "vitest run --passWithNoTests",
-    "typecheck": "tsc -p tsconfig.json"
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+    "sim": "tsx scripts/sim.ts",
+    "sim:fuzz": "tsx scripts/fuzz.ts"
   },
   "dependencies": {
     "@crdt/core": "workspace:*"
   },
   "devDependencies": {
+    "@types/node": "^22",
     "fast-check": "^4.10.2",
+    "tsx": "^4.23.15",
     "vitest": "^5.0.1"
   }
 }
