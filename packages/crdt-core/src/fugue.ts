@@ -1,3 +1,4 @@
+import { decodeFugueState, encodeFugueState } from "./fugue-codec";
 import { type Id, compareIds, idKey, isId } from "./ids";
 import { PendingBuffer } from "./pending";
 import type { SequenceCrdt } from "./sequence";
@@ -39,6 +40,7 @@ type IdTuple = [replicaId: string, counter: number];
 
 export interface FugueNodeJSON {
   id: IdTuple;
+  /** Empty for a tombstone. */
   char: string;
   parent: IdTuple | null;
   side: Side;
@@ -77,7 +79,8 @@ class FNode {
 
   constructor(
     readonly id: Id,
-    readonly char: string,
+    /** Emptied when the element is deleted: a tombstone only needs its position. */
+    public char: string,
     /** `null` is the root. */
     public parent: FNode | null,
     readonly side: Side,
@@ -361,6 +364,7 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
     const target = this.lookup(op.target) as FNode;
     if (!target.deleted) {
       target.deleted = true;
+      target.char = "";
       target.chunk.visible--;
       this.visible--;
     }
@@ -643,6 +647,15 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
     return { version: 1, vv, nodes };
   }
 
+  /** Compact binary form of `toJSON()`; see fugue-codec.ts for the format. */
+  encode(): Uint8Array {
+    return encodeFugueState(this.toJSON());
+  }
+
+  static decode(bytes: Uint8Array, replicaId: string): FugueMax {
+    return FugueMax.fromJSON(decodeFugueState(bytes), replicaId);
+  }
+
   /**
    * Rebuilds a replica from a full state. `replicaId` is the identity the new
    * replica will write as; its counter resumes from the state's version vector.
@@ -660,6 +673,7 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
       const node = new FNode(fromTuple(entry.id), entry.char, null, entry.side, null);
       if (entry.deletedBy !== undefined) {
         node.deleted = true;
+        node.char = "";
         node.deletedBy = entry.deletedBy.map(fromTuple);
       }
       if (chunk.nodes.length >= CHUNK_MAX * 0.75) {

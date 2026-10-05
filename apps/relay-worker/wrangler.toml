@@ -10,3 +10,16 @@ class_name = "DocumentDO"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["DocumentDO"]
+
+# Optional: archive superseded snapshots and compacted log segments to R2.
+# R2 has a free tier but must be enabled on the account first; then run
+#   wrangler r2 bucket create crdt-relay-snapshots
+# and uncomment. Without it the relay simply discards what it compacts away.
+# [[r2_buckets]]
+# binding = "SNAPSHOT_ARCHIVE"
+# bucket_name = "crdt-relay-snapshots"
+
+# Optional compaction thresholds (defaults: snapshot every 5000 ops, keep a 1000-op log tail).
+# [vars]
+# SNAPSHOT_EVERY_OPS = "5000"
+# LOG_TAIL_OPS = "1000"

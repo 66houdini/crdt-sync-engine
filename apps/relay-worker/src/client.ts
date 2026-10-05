@@ -1,4 +1,4 @@
-import { FugueMax, type FugueJSON, type FugueOp } from "@crdt/core";
+import { FugueMax, type FugueOp } from "@crdt/core";
 import type { ClientMessage, ServerMessage } from "./protocol";
 
 const OPS_PER_MESSAGE = 500;
@@ -29,7 +29,8 @@ export class ClientSession {
   private unacked: FugueOp[] = [];
   private since: number | null = null;
   private epoch: number | null = null;
-  private snapshotParts: string[] = [];
+  private snapshotFrames: Uint8Array[] = [];
+  private snapshotFramesExpected = 0;
 
   constructor(readonly replicaId: string) {
     this.doc = new FugueMax(replicaId);
@@ -46,7 +47,8 @@ export class ClientSession {
 
   /** Query string for the next connection attempt. */
   connectQuery(): string {
-    this.snapshotParts = [];
+    this.snapshotFrames = [];
+    this.snapshotFramesExpected = 0;
     const params = [`replica=${encodeURIComponent(this.replicaId)}`];
     if (this.since !== null && this.epoch !== null) params.push(`since=${this.since}`, `epoch=${this.epoch}`);
     return params.join("&");
@@ -67,16 +69,23 @@ export class ClientSession {
     return chunk(ops);
   }
 
-  receive(message: ServerMessage): ReceiveResult {
+  /** Handles one frame from the relay: a parsed JSON message, or the bytes of a binary frame. */
+  receive(message: ServerMessage | Uint8Array): ReceiveResult {
     const result: ReceiveResult = { send: [], reconnect: false, changed: false };
+    if (message instanceof Uint8Array) {
+      this.snapshotFrames.push(message);
+      if (this.snapshotFrames.length === this.snapshotFramesExpected) {
+        this.rebuildFrom(FugueMax.decode(concat(this.snapshotFrames), this.replicaId));
+        this.snapshotFrames = [];
+        this.snapshotFramesExpected = 0;
+        result.changed = true;
+      }
+      return result;
+    }
     switch (message.type) {
       case "snapshot": {
-        this.snapshotParts[message.index] = message.data;
-        if (message.index === message.total - 1) {
-          this.rebuildFrom(JSON.parse(this.snapshotParts.join("")) as FugueJSON);
-          this.snapshotParts = [];
-          result.changed = true;
-        }
+        this.snapshotFrames = [];
+        this.snapshotFramesExpected = message.frames;
         break;
       }
       case "ops": {
@@ -121,8 +130,7 @@ export class ClientSession {
    * longer exist anywhere. A local op that depended on such an op cannot be
    * replayed; it and the local ops after it are discarded.
    */
-  private rebuildFrom(state: FugueJSON): void {
-    const doc = FugueMax.fromJSON(state, this.replicaId);
+  private rebuildFrom(doc: FugueMax): void {
     const kept: FugueOp[] = [];
     for (const op of this.unacked) {
       if (doc.hasApplied(op.id)) continue;
@@ -133,6 +141,16 @@ export class ClientSession {
     this.doc = doc;
     this.unacked = kept;
   }
+}
+
+function concat(frames: readonly Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(frames.reduce((n, frame) => n + frame.length, 0));
+  let offset = 0;
+  for (const frame of frames) {
+    out.set(frame, offset);
+    offset += frame.length;
+  }
+  return out;
 }
 
 function chunk(ops: readonly FugueOp[]): ClientMessage[] {

@@ -7,10 +7,16 @@ import { REPLICA_ID_PATTERN, SERVER_REPLICA_ID, type SequencedOp, type ServerMes
 const FLUSH_INTERVAL_MS = 2000;
 /** Flush early once this many ops are buffered. */
 const MAX_BUFFERED_OPS = 1000;
-/** Upper bound for one stored batch row and for one outgoing frame (SQLite rows cap at 2 MB, frames at 1 MiB). */
+/** Upper bound for one stored batch row and for one outgoing text frame (SQLite values cap at 2 MB, frames at 1 MiB). */
 const MAX_CHUNK_CHARS = 250_000;
+/** Upper bound for one stored snapshot chunk and one outgoing binary frame. */
+const MAX_CHUNK_BYTES = 500_000;
 const MAX_INCOMING_CHARS = 250_000;
 const MAX_CHAR_LENGTH = 16;
+/** Fold the log into a snapshot once this many ops have accumulated since the last one. */
+const DEFAULT_SNAPSHOT_EVERY_OPS = 5000;
+/** Ops kept in the log behind a snapshot, so recently connected clients can still catch up incrementally. */
+const DEFAULT_LOG_TAIL_OPS = 1000;
 
 interface Attachment {
   replicaId: string;
@@ -27,6 +33,9 @@ interface Attachment {
  *  - Nothing that must survive hibernation lives only in memory: the document is
  *    rebuilt from SQLite in the constructor and each socket's replica id is stored
  *    in its attachment.
+ *  - Storage is bounded by the document, not its history: the log is periodically
+ *    folded into a compact binary snapshot and only a short tail of recent ops is
+ *    kept. Superseded snapshots and log segments go to R2 if a bucket is bound.
  *
  * Losing the un-flushed buffer (crash or eviction before the alarm) is detected,
  * not ignored: a pending alarm that this instance did not schedule means a previous
@@ -39,13 +48,23 @@ export class DocumentDO extends DurableObject<Env> {
   private seq = 0;
   /** Last sequence number persisted. */
   private durableSeq = 0;
+  /** Sequence number the stored snapshot reflects (0: no snapshot). */
+  private snapshotSeq = 0;
+  /** Ops with a greater sequence number are still in the log. */
+  private logStart = 0;
   private epoch = 0;
+  private docId: string | null = null;
   private buffer: SequencedOp[] = [];
   /** True iff this instance has an alarm pending for its own buffer. */
   private alarmScheduled = false;
+  private compacting = false;
+  private readonly snapshotEvery: number;
+  private readonly logTail: number;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.snapshotEvery = positiveInt(env.SNAPSHOT_EVERY_OPS, DEFAULT_SNAPSHOT_EVERY_OPS);
+    this.logTail = positiveInt(env.LOG_TAIL_OPS, DEFAULT_LOG_TAIL_OPS);
     void ctx.blockConcurrencyWhile(async () => {
       this.rehydrate();
       // An alarm we did not schedule belongs to a previous instance whose buffer is gone.
@@ -64,16 +83,47 @@ export class DocumentDO extends DurableObject<Env> {
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS op_batches (first_seq INTEGER PRIMARY KEY, last_seq INTEGER NOT NULL, ops TEXT NOT NULL)",
     );
+    this.sql.exec("CREATE TABLE IF NOT EXISTS snapshot_chunks (idx INTEGER PRIMARY KEY, data BLOB NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.epoch = Number(this.readMeta("epoch") ?? 0);
+    this.docId = this.readMeta("doc_id");
+    this.snapshotSeq = Number(this.readMeta("snapshot_seq") ?? 0);
 
+    const snapshot = this.readSnapshot();
+    if (snapshot !== null) this.doc = FugueMax.decode(snapshot, SERVER_REPLICA_ID);
+    this.seq = this.snapshotSeq;
+
+    // Replay only what the snapshot does not already contain. Rows at or below the
+    // snapshot are the retained tail, kept for client catch-up.
     for (const row of this.sql.exec<{ last_seq: number; ops: string }>(
-      "SELECT last_seq, ops FROM op_batches ORDER BY first_seq",
+      "SELECT last_seq, ops FROM op_batches WHERE last_seq > ? ORDER BY first_seq",
+      this.snapshotSeq,
     )) {
       for (const op of JSON.parse(row.ops) as FugueOp[]) this.doc.applyRemoteOp(op);
       this.seq = row.last_seq;
     }
     this.durableSeq = this.seq;
+    this.logStart = this.computeLogStart();
+  }
+
+  private computeLogStart(): number {
+    const first = this.sql.exec<{ first: number | null }>("SELECT MIN(first_seq) AS first FROM op_batches").one().first;
+    return first === null ? this.durableSeq : first - 1;
+  }
+
+  private readSnapshot(): Uint8Array | null {
+    const chunks = this.sql
+      .exec<{ data: ArrayBuffer }>("SELECT data FROM snapshot_chunks ORDER BY idx")
+      .toArray()
+      .map((row) => new Uint8Array(row.data));
+    if (chunks.length === 0) return null;
+    const out = new Uint8Array(chunks.reduce((n, chunk) => n + chunk.length, 0));
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
   }
 
   private readMeta(key: string): string | null {
@@ -95,11 +145,21 @@ export class DocumentDO extends DurableObject<Env> {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.endsWith("/text")) return new Response(this.doc.toString());
-    if (url.pathname.endsWith("/stats")) {
+    const segments = url.pathname.split("/");
+    const route = segments.pop();
+    if (this.docId === null) {
+      // Remember the document's name: an object only knows its opaque id, and archive keys should be readable.
+      this.docId = segments.pop() ?? "unnamed";
+      this.writeMeta("doc_id", this.docId);
+    }
+
+    if (route === "text") return new Response(this.doc.toString());
+    if (route === "stats") {
       return Response.json({
         seq: this.seq,
         durableSeq: this.durableSeq,
+        snapshotSeq: this.snapshotSeq,
+        logStart: this.logStart,
         epoch: this.epoch,
         buffered: this.buffer.length,
         length: this.doc.length,
@@ -107,7 +167,7 @@ export class DocumentDO extends DurableObject<Env> {
         connections: this.ctx.getWebSockets().length,
       });
     }
-    if (!url.pathname.endsWith("/ws")) return new Response("not found", { status: 404 });
+    if (route !== "ws") return new Response("not found", { status: 404 });
 
     const replicaId = url.searchParams.get("replica") ?? "";
     if (!REPLICA_ID_PATTERN.test(replicaId) || replicaId === SERVER_REPLICA_ID) {
@@ -132,7 +192,7 @@ export class DocumentDO extends DurableObject<Env> {
     const incremental =
       Number(params.get("epoch")) === this.epoch &&
       Number.isSafeInteger(since) &&
-      since >= this.logStartSeq() &&
+      since >= this.logStart &&
       since <= this.durableSeq;
 
     if (incremental) {
@@ -152,19 +212,19 @@ export class DocumentDO extends DurableObject<Env> {
       }
       if (page.length > 0) this.send(ws, { type: "ops", ops: page });
     } else {
-      const state = JSON.stringify(this.doc.toJSON());
-      const total = Math.max(1, Math.ceil(state.length / MAX_CHUNK_CHARS));
-      for (let index = 0; index < total; index++) {
-        const data = state.slice(index * MAX_CHUNK_CHARS, (index + 1) * MAX_CHUNK_CHARS);
-        this.send(ws, { type: "snapshot", index, total, data });
+      // Full state, in the compact binary encoding: a header, then that many binary frames.
+      const state = this.doc.encode();
+      const frames = Math.max(1, Math.ceil(state.length / MAX_CHUNK_BYTES));
+      this.send(ws, { type: "snapshot", frames });
+      for (let i = 0; i < frames; i++) {
+        try {
+          ws.send(state.subarray(i * MAX_CHUNK_BYTES, (i + 1) * MAX_CHUNK_BYTES));
+        } catch {
+          return;
+        }
       }
     }
     this.send(ws, { type: "synced", seq: this.durableSeq, epoch: this.epoch, counter: this.doc.appliedCount(replicaId) });
-  }
-
-  /** Ops with a sequence number greater than this are still in the log. */
-  private logStartSeq(): number {
-    return 0;
   }
 
   // ---------------------------------------------------------------- WebSocket (hibernation API)
@@ -248,7 +308,7 @@ export class DocumentDO extends DurableObject<Env> {
     void this.ctx.storage.setAlarm(Date.now() + FLUSH_INTERVAL_MS);
   }
 
-  override alarm(): void {
+  override async alarm(): Promise<void> {
     if (!this.alarmScheduled) {
       // Scheduled by a previous instance that never got to flush.
       if (this.buffer.length === 0) this.declareLoss();
@@ -256,6 +316,7 @@ export class DocumentDO extends DurableObject<Env> {
     }
     this.alarmScheduled = false;
     this.flush();
+    await this.compactIfDue();
   }
 
   /** Writes the buffered ops as one row per ~250 kB and acks every connected client. */
@@ -298,6 +359,63 @@ export class DocumentDO extends DurableObject<Env> {
     return { type: "ack", seq: this.durableSeq, epoch: this.epoch, counter: this.doc.appliedCount(replicaId) };
   }
 
+  // ---------------------------------------------------------------- snapshots and compaction
+
+  /**
+   * Folds the applied log into a snapshot once enough ops have accumulated, then
+   * trims the log to a short tail. Runs from the alarm, right after a flush, so
+   * the in-memory document is exactly the durable state at `durableSeq`.
+   *
+   * If an R2 bucket is bound, the snapshot being replaced and the log rows being
+   * dropped are copied there first; nothing is deleted from SQLite unless that
+   * succeeded. Without a bucket they are simply discarded: the new snapshot
+   * already contains everything needed to serve the document.
+   */
+  private async compactIfDue(): Promise<void> {
+    if (this.compacting || this.buffer.length > 0 || this.durableSeq - this.snapshotSeq < this.snapshotEvery) return;
+    this.compacting = true;
+    try {
+      // Captured synchronously: both describe the document at exactly `seq`,
+      // whatever arrives while the archive uploads are awaited below.
+      const seq = this.durableSeq;
+      const state = this.doc.encode();
+      const cutoff = seq - this.logTail;
+
+      const bucket = this.env.SNAPSHOT_ARCHIVE;
+      if (bucket !== undefined) {
+        const prefix = this.docId ?? this.ctx.id.toString();
+        const previous = this.readSnapshot();
+        if (previous !== null) await bucket.put(`${prefix}/snapshot-${pad(this.snapshotSeq)}.fgm`, previous);
+        const dropped = this.sql
+          .exec<{ first_seq: number; last_seq: number; ops: string }>(
+            "SELECT first_seq, last_seq, ops FROM op_batches WHERE last_seq <= ? ORDER BY first_seq",
+            cutoff,
+          )
+          .toArray();
+        for (const row of dropped) {
+          await bucket.put(`${prefix}/ops-${pad(row.first_seq)}-${pad(row.last_seq)}.json`, row.ops);
+        }
+      }
+
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec("DELETE FROM snapshot_chunks");
+        for (let i = 0; i * MAX_CHUNK_BYTES < Math.max(state.length, 1); i++) {
+          const chunk = state.slice(i * MAX_CHUNK_BYTES, (i + 1) * MAX_CHUNK_BYTES);
+          this.sql.exec("INSERT INTO snapshot_chunks (idx, data) VALUES (?, ?)", i, chunk.buffer);
+        }
+        this.writeMeta("snapshot_seq", String(seq));
+        this.sql.exec("DELETE FROM op_batches WHERE last_seq <= ?", cutoff);
+      });
+      this.snapshotSeq = seq;
+      this.logStart = this.computeLogStart();
+    } catch (err) {
+      // Compaction is an optimisation; the log is intact, so try again next time.
+      console.error("compaction failed", err);
+    } finally {
+      this.compacting = false;
+    }
+  }
+
   // ---------------------------------------------------------------- sending
 
   private send(ws: WebSocket, message: ServerMessage): void {
@@ -319,4 +437,14 @@ export class DocumentDO extends DurableObject<Env> {
       }
     }
   }
+}
+
+function positiveInt(raw: string | undefined, fallback: number): number {
+  const value = Number(raw);
+  return raw !== undefined && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+/** Zero-padded so archive keys sort in sequence order. */
+function pad(seq: number): string {
+  return String(seq).padStart(12, "0");
 }

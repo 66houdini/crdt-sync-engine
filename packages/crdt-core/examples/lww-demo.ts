@@ -4,7 +4,7 @@
  * must all converge. Timestamps come from per-replica Lamport clocks (never the
  * wall clock); all randomness comes from one seeded Prng.
  *
- *   pnpm --filter @crdt/core demo:lww -- --seed 42
+ *   pnpm demo:lww --seed 42
  */
 import { LWWMap, LWWRegister, Prng } from "../src/index";
 

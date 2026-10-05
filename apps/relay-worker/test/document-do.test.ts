@@ -30,6 +30,7 @@ class TestClient {
   ws: WebSocket | null = null;
   closeCode: number | null = null;
   synced = false;
+  binaryFrames = 0;
 
   constructor(
     readonly docId: string,
@@ -52,10 +53,16 @@ class TestClient {
     expect(res.status).toBe(101);
     const ws = res.webSocket as WebSocket;
     this.ws = ws;
+    ws.binaryType = "arraybuffer";
     ws.accept();
     ws.addEventListener("message", (event) => {
       if (this.ws !== ws) return; // a connection we already abandoned
-      const message = JSON.parse(event.data as string) as ServerMessage;
+      if (typeof event.data !== "string") {
+        this.binaryFrames++;
+        this.session.receive(new Uint8Array(event.data as ArrayBuffer));
+        return;
+      }
+      const message = JSON.parse(event.data) as ServerMessage;
       this.received.push(message);
       const result = this.session.receive(message);
       if (message.type === "synced") this.synced = true;
@@ -236,6 +243,67 @@ describe("DocumentDO relay", () => {
     await until(() => alice.session.unackedCount === 0, "resent ops acked");
     expect((await serverStats(docId)).durableSeq).toBe(16);
     expect(alice.text).toBe(bob.text);
+  });
+
+  it("folds the log into a snapshot, trims it to a tail, archives to R2, and still rehydrates", async () => {
+    // The test configuration snapshots every 30 ops and keeps a 10-op tail.
+    const docId = freshDocId();
+    const alice = await TestClient.open(docId, "alice");
+    const burst = async (n: number): Promise<void> => {
+      alice.type(alice.text.length, String.fromCharCode(96 + n).repeat(12));
+      await untilAsync(async () => (await serverStats(docId)).seq === n * 12, `burst ${n} applied`);
+      await runDurableObjectAlarm(stubFor(docId));
+      await until(() => alice.session.unackedCount === 0, `burst ${n} acked`);
+    };
+
+    await burst(1);
+    const early = await TestClient.open(docId, "early"); // synced at seq 12
+    early.disconnect();
+    await burst(2);
+    expect((await serverStats(docId)).snapshotSeq).toBe(0);
+    expect(await batchRows(docId)).toBe(2);
+
+    await burst(3); // 36 ops since the (absent) snapshot: compaction runs
+    let stats = await serverStats(docId);
+    expect(stats.snapshotSeq).toBe(36);
+    expect(stats.logStart).toBe(24); // only the batch covering seq 25..36 is kept as the tail
+    expect(await batchRows(docId)).toBe(1);
+
+    const archive = env.SNAPSHOT_ARCHIVE as R2Bucket;
+    const keys = async (): Promise<string[]> => (await archive.list({ prefix: `${docId}/` })).objects.map((o) => o.key);
+    expect(await keys()).toEqual([`${docId}/ops-000000000001-000000000012.json`, `${docId}/ops-000000000013-000000000024.json`]);
+    const archived = JSON.parse(await (await archive.get(`${docId}/ops-000000000001-000000000012.json`))!.text()) as unknown[];
+    expect(archived).toHaveLength(12);
+
+    const recent = await TestClient.open(docId, "recent"); // synced at seq 36
+    recent.disconnect();
+    await burst(4);
+
+    // A cold start now loads the snapshot and replays only the ops after it.
+    await evictDurableObject(stubFor(docId));
+    const expected = "a".repeat(12) + "b".repeat(12) + "c".repeat(12) + "d".repeat(12);
+    expect(await serverText(docId)).toBe(expected);
+    expect((await serverStats(docId)).seq).toBe(48);
+
+    // A client whose position is still inside the log tail catches up incrementally...
+    await recent.connect();
+    expect(recent.text).toBe(expected);
+    expect(recent.count("snapshot")).toBe(1); // only the one from its very first connection
+    // ...one that fell behind the tail gets a fresh (binary) snapshot instead.
+    const framesBefore = early.binaryFrames;
+    await early.connect();
+    expect(early.text).toBe(expected);
+    expect(early.count("snapshot")).toBe(2);
+    expect(early.binaryFrames).toBe(framesBefore + 1);
+
+    // The next compaction archives the snapshot it replaces.
+    await burst(5);
+    await burst(6); // seq 72: 36 ops past the snapshot
+    stats = await serverStats(docId);
+    expect(stats.snapshotSeq).toBe(72);
+    expect(await keys()).toContain(`${docId}/snapshot-000000000036.fgm`);
+    await evictDurableObject(stubFor(docId));
+    expect(await serverText(docId)).toBe(expected + "e".repeat(12) + "f".repeat(12));
   });
 
   it("rejects malformed and spoofed ops without disturbing the document", async () => {

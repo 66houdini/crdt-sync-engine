@@ -1,7 +1,17 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src", "test", "examples"]
+  "include": [
+    "src",
+    "test",
+    "examples",
+    "bench"
+  ],
+  "exclude": [
+    "bench/.data"
+  ]
 }

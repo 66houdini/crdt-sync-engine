@@ -3,7 +3,7 @@
  * two clients type concurrently, one is cut off mid-edit and keeps typing, then
  * reconnects; both must converge with each other and with the relay.
  *
- *   pnpm --filter @crdt/demo-client smoke [-- --url ws://127.0.0.1:8787]
+ *   pnpm --filter @crdt/demo-client smoke [--url ws://127.0.0.1:8787]
  */
 import { Connection, parseArgs } from "./connection";
 

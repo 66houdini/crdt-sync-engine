@@ -1,7 +1,7 @@
 /**
  * Minimal interactive client for the relay. A sanity-check tool, not a product.
  *
- *   pnpm --filter @crdt/demo-client start -- --doc demo --replica alice [--url ws://127.0.0.1:8787]
+ *   pnpm --filter @crdt/demo-client start --doc demo --replica alice [--url ws://127.0.0.1:8787]
  *
  * Run it twice with different --replica values, type in both, `drop` one
  * mid-edit, keep typing, then `connect` and watch the two reconcile.

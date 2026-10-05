@@ -26,7 +26,7 @@ describe("simulator determinism", () => {
     const run = runSeed(fugue, 12345);
     expect({ replicas: run.options.replicas, steps: run.options.steps, text: run.text, digest: run.digest }).toMatchInlineSnapshot(`
       {
-        "digest": "8d4d2b89",
+        "digest": "87b6b8d4",
         "replicas": 5,
         "steps": 119,
         "text": "yawzorwjhebttayednrltlgmhumulzypwkjpfvbgszuwlfutapelggnsastyhrfmtpwywssioewajpqjxuptvaetcehdtea",

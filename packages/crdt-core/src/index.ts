@@ -23,3 +23,10 @@ export {
   type FugueOp,
   type Side,
 } from "./fugue";
+export {
+  decodeFugueState,
+  encodeFugueState,
+  utf8Decode,
+  utf8Encode,
+  type FugueEncodingBreakdown,
+} from "./fugue-codec";

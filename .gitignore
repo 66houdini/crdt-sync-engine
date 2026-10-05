@@ -4,3 +4,4 @@ dist/
 coverage/
 *.log
 .dev.vars
+packages/crdt-core/bench/.data/

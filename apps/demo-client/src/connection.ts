@@ -25,14 +25,16 @@ export class Connection {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(`${this.baseUrl}/doc/${this.docId}/ws?${this.session.connectQuery()}`);
       this.ws = ws;
+      ws.binaryType = "arraybuffer";
       ws.addEventListener("message", (event) => {
         if (this.ws !== ws) return;
-        const message = JSON.parse(String(event.data)) as ServerMessage;
+        const message: ServerMessage | Uint8Array =
+          typeof event.data === "string" ? (JSON.parse(event.data) as ServerMessage) : new Uint8Array(event.data as ArrayBuffer);
         const result = this.session.receive(message);
         this.sendAll(result.send);
         if (result.error !== undefined) this.onStatus(`relay error: ${result.error}`);
         if (result.changed) this.onChange();
-        if (message.type === "synced") {
+        if (!(message instanceof Uint8Array) && message.type === "synced") {
           this.onStatus(`synced (seq ${message.seq}, epoch ${message.epoch})`);
           resolve();
         }
@@ -79,7 +81,7 @@ export function parseArgs(argv: readonly string[], defaults: Record<string, stri
   const out = { ...defaults };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i] as string;
-    if (arg.startsWith("--") && argv[i + 1] !== undefined) out[arg.slice(2)] = argv[++i] as string;
+    if (arg.length > 2 && arg.startsWith("--") && argv[i + 1] !== undefined) out[arg.slice(2)] = argv[++i] as string;
   }
   return out;
 }

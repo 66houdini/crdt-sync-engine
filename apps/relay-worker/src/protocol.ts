@@ -1,7 +1,8 @@
 import type { FugueOp } from "@crdt/core";
 
 /**
- * Wire protocol between a client replica and a DocumentDO. All messages are JSON text frames.
+ * Wire protocol between a client replica and a DocumentDO. Messages are JSON text
+ * frames, except for snapshot data, which is sent as binary frames.
  *
  * Connect:  GET /doc/<documentId>/ws?replica=<id>[&since=<seq>&epoch=<n>]   (WebSocket upgrade)
  *
@@ -23,8 +24,11 @@ export interface SequencedOp {
 export type ClientMessage = { type: "ops"; ops: FugueOp[] };
 
 export type ServerMessage =
-  /** One slice of the JSON-encoded FugueJSON state; slices arrive in order, `index` 0..total-1. */
-  | { type: "snapshot"; index: number; total: number; data: string }
+  /**
+   * Announces a full state transfer: the next `frames` binary frames, concatenated,
+   * are the document in FugueMax's binary encoding (`FugueMax.decode`).
+   */
+  | { type: "snapshot"; frames: number }
   /** Ops from other replicas (live), or the catch-up tail after `since` (may include the client's own). */
   | { type: "ops"; ops: SequencedOp[] }
   /** End of the initial sync. Everything up to `seq` is durable; `counter` of this client's ops are durable. */
