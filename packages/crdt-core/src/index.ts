@@ -12,3 +12,13 @@ export { type Id, compareIds, idEquals, idKey, isId } from "./ids";
 export { PendingBuffer } from "./pending";
 export type { SequenceCrdt } from "./sequence";
 export { RGA, type RgaJSON, type RgaOp } from "./rga";
+export {
+  FugueMax,
+  parseFugueOp,
+  type FugueDeleteOp,
+  type FugueInsertOp,
+  type FugueJSON,
+  type FugueNodeJSON,
+  type FugueOp,
+  type Side,
+} from "./fugue";
