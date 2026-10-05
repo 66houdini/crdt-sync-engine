@@ -8,3 +8,7 @@ export {
   type Stamp,
 } from "./lww-register";
 export { LWWMap, type LWWMapEntryJSON, type LWWMapJSON, type LWWMapKey } from "./lww-map";
+export { type Id, compareIds, idEquals, idKey, isId } from "./ids";
+export { PendingBuffer } from "./pending";
+export type { SequenceCrdt } from "./sequence";
+export { RGA, type RgaJSON, type RgaOp } from "./rga";
