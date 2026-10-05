@@ -23,6 +23,8 @@ jobs:
       # Reproduce locally with: pnpm sim --seed <seed> --trace
       - name: Convergence fuzz, FugueMax (2000 seeds)
         run: pnpm sim:fuzz --seeds 2000
+      - name: Convergence fuzz, FugueMax with tombstone GC (1000 seeds)
+        run: pnpm sim:fuzz --gc --seeds 1000
       - name: Convergence fuzz, RGA baseline (500 seeds)
         run: pnpm sim:fuzz --crdt rga --seeds 500
       - name: Worker bundles

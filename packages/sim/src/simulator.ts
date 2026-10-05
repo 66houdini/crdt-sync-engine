@@ -45,6 +45,23 @@ export function randomOptions(rng: Prng): SimOptions {
   };
 }
 
+/**
+ * Optional background protocol that rides on the same faulty network as the ops,
+ * e.g. garbage-collection gossip. Its messages are reordered, duplicated and held
+ * back by partitions exactly like ops are.
+ */
+export interface Maintenance<Op> {
+  /** Relative likelihood of a maintenance step (same scale as SimOptions.weights). */
+  weight: number;
+  /** Called once, after the replicas are created. */
+  setup(replicas: readonly SequenceCrdt<Op>[]): void;
+  /** Produces a payload to send to every other replica. */
+  emit(doc: SequenceCrdt<Op>): unknown;
+  receive(doc: SequenceCrdt<Op>, payload: unknown): void;
+  /** Full gossip rounds to run once the network is quiet. */
+  settleRounds: number;
+}
+
 export interface SimStats {
   inserts: number;
   deletes: number;
@@ -72,7 +89,9 @@ interface Message<Op> {
   readonly n: number;
   readonly from: number;
   readonly to: number;
-  readonly op: Op;
+  readonly op: Op | null;
+  /** Maintenance payload, when `op` is null. */
+  readonly aux: unknown;
   deliveries: number;
 }
 
@@ -94,8 +113,14 @@ const ALPHABET = "abcdefghijklmnopqrstuvwxyz";
  * in random order. It does not itself assert convergence; pass the result's
  * replicas to `assertConverged`.
  */
-export function runSimulation<Op>(factory: CrdtFactory<Op>, rng: Prng, options: SimOptions = DEFAULT_OPTIONS): SimResult<Op> {
+export function runSimulation<Op>(
+  factory: CrdtFactory<Op>,
+  rng: Prng,
+  options: SimOptions = DEFAULT_OPTIONS,
+  maintenance: Maintenance<Op> | null = null,
+): SimResult<Op> {
   const replicas = Array.from({ length: options.replicas }, (_, i) => factory(`r${i}`));
+  maintenance?.setup(replicas);
   const inFlight: Message<Op>[] = [];
   const partitionedUntil = replicas.map(() => 0);
   const trace: string[] = [];
@@ -116,9 +141,9 @@ export function runSimulation<Op>(factory: CrdtFactory<Op>, rng: Prng, options: 
     trace.push(`${String(step).padStart(4, "0")} ${line}`);
   };
 
-  const broadcast = (from: number, op: Op): void => {
+  const broadcast = (from: number, op: Op | null, aux: unknown = null): void => {
     for (let to = 0; to < replicas.length; to++) {
-      if (to !== from) inFlight.push({ n: messageCount++, from, to, op, deliveries: 0 });
+      if (to !== from) inFlight.push({ n: messageCount++, from, to, op, aux, deliveries: 0 });
     }
     if (inFlight.length > stats.maxInFlight) stats.maxInFlight = inFlight.length;
   };
@@ -127,13 +152,14 @@ export function runSimulation<Op>(factory: CrdtFactory<Op>, rng: Prng, options: 
     const message = inFlight[index] as Message<Op>;
     const overtook = inFlight.some((m) => m.from === message.from && m.to === message.to && m.n < message.n && m.deliveries === 0);
     const target = replicas[message.to] as SequenceCrdt<Op>;
-    target.applyRemoteOp(message.op);
+    if (message.op !== null) target.applyRemoteOp(message.op);
+    else maintenance?.receive(target, message.aux);
     stats.delivered++;
     if (message.deliveries > 0) stats.duplicated++;
     else if (overtook) stats.reordered++;
     message.deliveries++;
     if (target.pendingCount > stats.maxBuffered) stats.maxBuffered = target.pendingCount;
-    log(`deliver${keepInFlight ? "+keep" : ""} #${message.n} r${message.from}->r${message.to}`);
+    log(`deliver${keepInFlight ? "+keep" : ""}${message.op === null ? " gossip" : ""} #${message.n} r${message.from}->r${message.to}`);
     if (!keepInFlight) {
       inFlight[index] = inFlight[inFlight.length - 1] as Message<Op>;
       inFlight.pop();
@@ -184,7 +210,7 @@ export function runSimulation<Op>(factory: CrdtFactory<Op>, rng: Prng, options: 
   };
 
   const { weights } = options;
-  const totalWeight = weights.edit + weights.deliver + weights.duplicate + weights.partition;
+  const totalWeight = weights.edit + weights.deliver + weights.duplicate + weights.partition + (maintenance?.weight ?? 0);
 
   for (step = 1; step <= options.steps; step++) {
     for (let r = 0; r < replicas.length; r++) {
@@ -206,6 +232,10 @@ export function runSimulation<Op>(factory: CrdtFactory<Op>, rng: Prng, options: 
       const candidates = deliverableIndices();
       if (candidates.length === 0) edit();
       else deliver(rng.pick(candidates), true);
+    } else if (maintenance !== null && (roll -= maintenance.weight) < 0) {
+      const r = rng.int(replicas.length);
+      broadcast(r, null, maintenance.emit(replicas[r] as SequenceCrdt<Op>));
+      log(`r${r} gossip`);
     } else {
       const r = rng.int(replicas.length);
       if (partitionedUntil[r] === 0) {
@@ -225,6 +255,18 @@ export function runSimulation<Op>(factory: CrdtFactory<Op>, rng: Prng, options: 
     const again = rng.bool(0.1);
     deliver(inFlight.findIndex((m) => m.n === n), again);
     if (again) deliver(inFlight.findIndex((m) => m.n === n), false);
+  }
+
+  if (maintenance !== null) {
+    for (let round = 1; round <= maintenance.settleRounds; round++) {
+      log(`settle round ${round}`);
+      const payloads = replicas.map((doc) => maintenance.emit(doc));
+      replicas.forEach((doc, to) => {
+        payloads.forEach((payload, from) => {
+          if (from !== to) maintenance.receive(doc, payload);
+        });
+      });
+    }
   }
 
   return { replicas, options, stats, trace };

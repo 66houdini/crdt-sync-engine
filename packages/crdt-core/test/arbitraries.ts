@@ -6,7 +6,7 @@ export const REPLICA_IDS = ["a", "b", "c", "d"] as const;
 /** Arbitrary list of items whose (timestamp, replicaId) stamps are pairwise distinct. */
 export function uniqueStamped<T extends Stamp>(
   item: fc.Arbitrary<T>,
-  constraints: { minLength?: number; maxLength?: number } = {},
+  constraints: { minLength?: number; maxLength?: number; size?: fc.SizeForArbitrary } = {},
 ): fc.Arbitrary<T[]> {
   return fc.uniqueArray(item, {
     selector: (x) => `${x.timestamp}|${x.replicaId}`,

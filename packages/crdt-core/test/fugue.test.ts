@@ -57,7 +57,7 @@ describe("FugueMax vs the paper's Algorithm 1 (differential)", () => {
 
   it("generates identical ops and identical text at every step, including in concurrent states", () => {
     fc.assert(
-      fc.property(fc.array(stepArb, { maxLength: 70 }), (steps) => {
+      fc.property(fc.array(stepArb, { maxLength: 70, size: "max" }), (steps) => {
         const peers = ["a", "b", "c"].map((id) => ({
           impl: new FugueMax(id),
           ref: new ReferenceFugueMax(id),

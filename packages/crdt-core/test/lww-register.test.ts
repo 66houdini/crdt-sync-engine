@@ -10,7 +10,7 @@ const writeArb: fc.Arbitrary<Write> = fc
   .tuple(stampArb(), fc.oneof(fc.integer(), fc.string({ maxLength: 4 })))
   .map(([stamp, value]) => ({ ...stamp, value }));
 
-const writePool = uniqueStamped(writeArb, { minLength: 1, maxLength: 12 });
+const writePool = uniqueStamped(writeArb, { minLength: 1, maxLength: 12, size: "max" });
 
 function registerFrom(writes: readonly Write[]): LWWRegister<Value> {
   return writes.reduce(

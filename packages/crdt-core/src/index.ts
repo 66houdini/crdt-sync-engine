@@ -16,6 +16,7 @@ export {
   FugueMax,
   parseFugueOp,
   type FugueDeleteOp,
+  type FugueHeartbeat,
   type FugueInsertOp,
   type FugueJSON,
   type FugueNodeJSON,

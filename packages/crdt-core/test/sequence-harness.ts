@@ -25,7 +25,7 @@ const actionArb: fc.Arbitrary<Action> = fc.oneof(
 
 export const scenarioArb: fc.Arbitrary<Scenario> = fc.record({
   replicas: fc.integer({ min: 2, max: 4 }),
-  actions: fc.array(actionArb, { maxLength: 80 }),
+  actions: fc.array(actionArb, { maxLength: 80, size: "max" }),
   finalSeed: fc.integer(),
 });
 

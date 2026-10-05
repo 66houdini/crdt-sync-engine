@@ -28,6 +28,13 @@ export interface FugueDeleteOp {
 
 export type FugueOp = FugueInsertOp | FugueDeleteOp;
 
+/** Garbage-collection gossip: what a replica has applied, and what it knows every member has applied. */
+export interface FugueHeartbeat {
+  readonly replicaId: string;
+  readonly vv: [replicaId: string, count: number][];
+  readonly stable: [replicaId: string, count: number][];
+}
+
 type IdTuple = [replicaId: string, counter: number];
 
 export interface FugueNodeJSON {
@@ -63,6 +70,10 @@ class FNode {
   deleted = false;
   deletedBy: Id[] | null = null;
   chunk!: Chunk;
+  /** How many elements name this one as their right origin. */
+  rightOriginRefs = 0;
+  /** Physically removed by garbage collection. */
+  removed = false;
 
   constructor(
     readonly id: Id,
@@ -174,12 +185,23 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
       throw new TypeError("FugueMax.insert requires a non-empty string");
     }
     const leftOrigin = index === 0 ? null : this.visibleAt(index - 1);
-    const rightOrigin = leftOrigin === null ? this.first() : this.nextInOrder(leftOrigin);
-    const rightSiblings = leftOrigin === null ? this.rootRight : leftOrigin.rightChildren;
+    let rightOrigin = leftOrigin === null ? this.first() : this.nextInOrder(leftOrigin);
+    let asLeftChild: boolean;
+    if (this.gc !== null && rightOrigin !== null && this.isCondemned(rightOrigin)) {
+      // Garbage collection, phase 1: never reference a tombstone that is known to
+      // be causally stable (see the GC section). Skip to the next element that may
+      // still be referenced and decide the side from where it sits.
+      do rightOrigin = this.nextInOrder(rightOrigin);
+      while (rightOrigin !== null && this.isCondemned(rightOrigin));
+      asLeftChild = rightOrigin !== null && isRightDescendant(rightOrigin, leftOrigin);
+    } else {
+      const rightSiblings = leftOrigin === null ? this.rootRight : leftOrigin.rightChildren;
+      asLeftChild = rightSiblings !== null && rightSiblings.length > 0;
+    }
     const id = this.nextDot();
 
     let op: FugueInsertOp;
-    if (rightSiblings === null || rightSiblings.length === 0) {
+    if (!asLeftChild) {
       op = {
         type: "insert",
         id,
@@ -286,6 +308,7 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
     const parent = op.parent === null ? null : (this.lookup(op.parent) as FNode);
     const rightOrigin = op.rightOrigin === null ? null : (this.lookup(op.rightOrigin) as FNode);
     const node = new FNode(op.id, op.char, parent, op.side, rightOrigin);
+    if (rightOrigin !== null) rightOrigin.rightOriginRefs++;
 
     if (op.side === "right") {
       const siblings = parent === null ? this.rootRight : (parent.rightChildren ??= []);
@@ -413,6 +436,181 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
     for (let c: Chunk | null = this.head; c !== null; c = c.next) yield* c.nodes;
   }
 
+  // ---------------------------------------------------------------- garbage collection
+  //
+  // A tombstone cannot simply be dropped when it is deleted, or even when the
+  // local replica is done with it, for two separate reasons.
+  //
+  // 1. Concurrent ops. Another replica that has not yet seen the delete may, at
+  //    this very moment, be inserting next to the element (making it a parent or a
+  //    right origin) or deleting it as well. Such an op is concurrent with the
+  //    delete and can arrive arbitrarily late. If the element were already gone,
+  //    the op could not be placed: the replica would have to drop it (diverging
+  //    from replicas that still hold the element) or guess a position (diverging
+  //    in order). So nothing may be removed before the delete is CAUSALLY STABLE:
+  //    every member is known to have applied it, hence anything concurrent with
+  //    it has already been issued. This is what the version-vector tracking is for.
+  //
+  // 2. Later ops. Causal stability alone is still not enough for Fugue. An insert
+  //    takes as right origin the next element INCLUDING tombstones, and may become
+  //    a left child of it. So a replica that has seen the delete keeps creating
+  //    references to the tombstone for as long as it holds it, and replicas learn
+  //    about stability at different times. Removal therefore takes two phases:
+  //
+  //      Phase 1 (condemn). Once a replica's own stable cut covers the delete, it
+  //      stops referencing the tombstone in new inserts (see insert()).
+  //      Phase 2 (remove). A replica removes the tombstone once, for every member
+  //      m, it holds a heartbeat in which m's stable cut covers the delete, and it
+  //      has applied every op m issued before sending that heartbeat. From then on
+  //      no op anywhere can name the element: older ops are all applied locally,
+  //      newer ones avoid it by phase 1. If the applied ops left it with children
+  //      or as somebody's right origin it stays as structure until those are
+  //      removed too; otherwise it is deleted for good.
+  //
+  // Membership is fixed and explicit. A replica outside the member list must join
+  // by state transfer (fromJSON), never by replaying old ops.
+
+  private gc: GcState | null = null;
+
+  /**
+   * Turns on tombstone collection for a fixed set of replicas (which must include
+   * this one). Until every member has reported in, nothing is ever removed.
+   */
+  enableGc(members: readonly string[]): void {
+    if (!members.includes(this.replicaId)) throw new Error("FugueMax.enableGc: members must include this replica");
+    this.gc = { members: [...new Set(members)].sort(), peerVV: new Map(), peerStable: new Map(), stable: new Map() };
+  }
+
+  /** What this replica has applied and what it knows to be stable. Send it to every member now and then. */
+  heartbeat(): FugueHeartbeat {
+    const gc = this.requireGc();
+    this.refreshStable(gc);
+    return { replicaId: this.replicaId, vv: [...this.vv], stable: [...gc.stable] };
+  }
+
+  /** Records a member's heartbeat. Safe under reordering and duplication. */
+  receiveHeartbeat(hb: FugueHeartbeat): void {
+    const gc = this.requireGc();
+    if (hb.replicaId === this.replicaId || !gc.members.includes(hb.replicaId)) return;
+
+    let known = gc.peerVV.get(hb.replicaId);
+    if (known === undefined) gc.peerVV.set(hb.replicaId, (known = new Map()));
+    for (const [replica, count] of hb.vv) {
+      if (count > (known.get(replica) ?? 0)) known.set(replica, count);
+    }
+
+    // An announcement reads: "from my op number `at` on, I reference nothing
+    // condemned under `cut`". It only becomes usable once all of the sender's ops
+    // below `at` have been applied here, so a short history is kept: a sender that
+    // keeps editing must not keep postponing collection of older tombstones.
+    const at = hb.vv.find(([replica]) => replica === hb.replicaId)?.[1] ?? 0;
+    let history = gc.peerStable.get(hb.replicaId);
+    if (history === undefined) gc.peerStable.set(hb.replicaId, (history = []));
+    let i = history.length;
+    while (i > 0 && (history[i - 1] as Announcement).at > at) i--;
+    const same = i > 0 && (history[i - 1] as Announcement).at === at ? (history[i - 1] as Announcement) : null;
+    if (same !== null) {
+      for (const [replica, count] of hb.stable) {
+        if (count > (same.cut.get(replica) ?? 0)) same.cut.set(replica, count);
+      }
+    } else {
+      history.splice(i, 0, { cut: new Map(hb.stable), at });
+      // Bounded memory: thin out the middle, keeping the oldest and the newest.
+      if (history.length > MAX_ANNOUNCEMENTS) history.splice(1, 1);
+    }
+    this.refreshStable(gc);
+  }
+
+  /** Physically removes every tombstone that is provably unreferenced forever. Returns how many were removed. */
+  collectGarbage(): number {
+    if (this.gc === null) return 0;
+    const cut = this.removalCut(this.gc);
+    if (cut.size === 0) return 0;
+
+    const candidates: FNode[] = [];
+    for (const node of this.inOrder()) if (isRemovable(node, cut)) candidates.push(node);
+
+    let removed = 0;
+    for (let node = candidates.pop(); node !== undefined; node = candidates.pop()) {
+      if (!isRemovable(node, cut)) continue;
+      this.removeNode(node);
+      removed++;
+      // Removing a leaf may free its parent or its right origin.
+      if (node.parent !== null) candidates.push(node.parent);
+      if (node.rightOrigin !== null) candidates.push(node.rightOrigin);
+    }
+    return removed;
+  }
+
+  private requireGc(): GcState {
+    if (this.gc === null) throw new Error("FugueMax: call enableGc(members) first");
+    return this.gc;
+  }
+
+  /** Advances this replica's stable cut: per replica, the op count every member is known to have applied. */
+  private refreshStable(gc: GcState): void {
+    for (const [replica, mine] of this.vv) {
+      let min = mine;
+      for (const member of gc.members) {
+        if (member === this.replicaId) continue;
+        min = Math.min(min, gc.peerVV.get(member)?.get(replica) ?? 0);
+      }
+      if (min > (gc.stable.get(replica) ?? 0)) gc.stable.set(replica, min);
+    }
+  }
+
+  /** Phase 1 test: this tombstone's delete is stable as far as this replica knows. */
+  private isCondemned(node: FNode): boolean {
+    if (!node.deleted || this.gc === null) return false;
+    const { stable } = this.gc;
+    return (node.deletedBy as Id[]).some((dot) => (stable.get(dot.replicaId) ?? 0) > dot.counter);
+  }
+
+  /**
+   * Phase 2 cut: deletes below it are condemned at every member, and every op a
+   * member issued before condemning has been applied here. Empty if that cannot
+   * be established yet for some member.
+   */
+  private removalCut(gc: GcState): Map<string, number> {
+    this.refreshStable(gc);
+    const cut = new Map(gc.stable);
+    for (const member of gc.members) {
+      if (member === this.replicaId) continue;
+      // The newest announcement whose precondition holds; older ones are then obsolete.
+      const history = gc.peerStable.get(member) ?? [];
+      const applied = this.vv.get(member) ?? 0;
+      let usable = -1;
+      while (usable + 1 < history.length && (history[usable + 1] as Announcement).at <= applied) usable++;
+      if (usable < 0) return new Map();
+      if (usable > 0) history.splice(0, usable);
+      const announced = history[0] as Announcement;
+      for (const [replica, count] of cut) cut.set(replica, Math.min(count, announced.cut.get(replica) ?? 0));
+    }
+    return cut;
+  }
+
+  private removeNode(node: FNode): void {
+    const siblings =
+      node.side === "left"
+        ? ((node.parent as FNode).leftChildren as FNode[])
+        : node.parent === null
+          ? this.rootRight
+          : (node.parent.rightChildren as FNode[]);
+    siblings.splice(siblings.indexOf(node), 1);
+
+    const chunk = node.chunk;
+    chunk.nodes.splice(chunk.nodes.indexOf(node), 1);
+    if (chunk.nodes.length === 0 && chunk.prev !== null) {
+      chunk.prev.next = chunk.next;
+      if (chunk.next !== null) chunk.next.prev = chunk.prev;
+    }
+
+    if (node.rightOrigin !== null) node.rightOrigin.rightOriginRefs--;
+    (this.nodes.get(node.id.replicaId) as (FNode | undefined)[])[node.id.counter] = undefined;
+    node.removed = true;
+    this.total--;
+  }
+
   // ---------------------------------------------------------------- output
 
   toString(): string {
@@ -496,12 +694,46 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
       const parent = resolve(entry.parent);
       node.parent = parent;
       node.rightOrigin = resolve(entry.rightOrigin);
+      if (node.rightOrigin !== null) node.rightOrigin.rightOriginRefs++;
       if (entry.side === "right") (parent === null ? doc.rootRight : (parent.rightChildren ??= [])).push(node);
       else if (parent === null) throw new Error("FugueMax.fromJSON: the root has no left children");
       else (parent.leftChildren ??= []).push(node);
     });
     return doc;
   }
+}
+
+/** A member's stable cut, and that member's own op count at the moment it announced it. */
+interface Announcement {
+  cut: Map<string, number>;
+  at: number;
+}
+
+const MAX_ANNOUNCEMENTS = 16;
+
+interface GcState {
+  members: string[];
+  /** Latest version vector heard from each other member. */
+  peerVV: Map<string, Map<string, number>>;
+  /** Stable cuts announced by each other member, oldest first. */
+  peerStable: Map<string, Announcement[]>;
+  /** This replica's own stable cut. Only ever grows. */
+  stable: Map<string, number>;
+}
+
+function isRemovable(node: FNode, cut: Map<string, number>): boolean {
+  if (!node.deleted || node.removed || node.rightOriginRefs > 0) return false;
+  if ((node.leftChildren?.length ?? 0) > 0 || (node.rightChildren?.length ?? 0) > 0) return false;
+  return (node.deletedBy as Id[]).some((dot) => (cut.get(dot.replicaId) ?? 0) > dot.counter);
+}
+
+/** True iff `node` lies in the right subtree of `ancestor` (`null` is the root, whose children are all right children). */
+function isRightDescendant(node: FNode, ancestor: FNode | null): boolean {
+  if (ancestor === null) return true;
+  for (let n: FNode = node; n.parent !== null; n = n.parent) {
+    if (n.parent === ancestor) return n.side === "right";
+  }
+  return false;
 }
 
 function lastInSubtree(node: FNode): FNode {

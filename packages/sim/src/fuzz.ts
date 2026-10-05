@@ -1,6 +1,6 @@
 import { Prng, type SequenceCrdt } from "@crdt/core";
 import { assertConverged } from "./assert";
-import { type CrdtFactory, type SimResult, randomOptions, runSimulation } from "./simulator";
+import { type CrdtFactory, type Maintenance, type SimResult, randomOptions, runSimulation } from "./simulator";
 
 /** 32-bit FNV-1a, as 8 hex digits. Used to fingerprint a run so two runs can be compared at a glance. */
 export function fnv1a(text: string): string {
@@ -24,9 +24,9 @@ export interface SeedRun<Op> extends SimResult<Op> {
  * the scenario shape and then drives the whole run. Throws if the replicas do
  * not converge. Everything the fuzzer and `pnpm sim --seed N` do goes through here.
  */
-export function runSeed<Op>(factory: CrdtFactory<Op>, seed: number): SeedRun<Op> {
+export function runSeed<Op>(factory: CrdtFactory<Op>, seed: number, maintenance: Maintenance<Op> | null = null): SeedRun<Op> {
   const rng = new Prng(seed);
-  const result = runSimulation(factory, rng, randomOptions(rng));
+  const result = runSimulation(factory, rng, randomOptions(rng), maintenance);
   assertConverged(result.replicas);
   const first = result.replicas[0] as SequenceCrdt<Op>;
   return {
@@ -49,11 +49,16 @@ export interface FuzzReport {
 }
 
 /** Runs seeds `start .. start+count-1` and stops at the first failure. */
-export function fuzz<Op>(factory: CrdtFactory<Op>, start: number, count: number): FuzzReport {
+export function fuzz<Op>(
+  factory: CrdtFactory<Op>,
+  start: number,
+  count: number,
+  maintenance: Maintenance<Op> | null = null,
+): FuzzReport {
   const totals = { inserts: 0, deletes: 0, delivered: 0, duplicated: 0, reordered: 0, partitions: 0, buffered: 0 };
   for (let seed = start; seed < start + count; seed++) {
     try {
-      const { stats } = runSeed(factory, seed);
+      const { stats } = runSeed(factory, seed, maintenance);
       totals.inserts += stats.inserts;
       totals.deletes += stats.deletes;
       totals.delivered += stats.delivered;

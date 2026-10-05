@@ -14,7 +14,7 @@ const opArb: fc.Arbitrary<Op> = fc
     isSet ? { ...stamp, kind: "set", key, value } : { ...stamp, kind: "delete", key },
   );
 
-const opPool = uniqueStamped(opArb, { maxLength: 30 });
+const opPool = uniqueStamped(opArb, { maxLength: 30, size: "max" });
 
 function apply(map: LWWMap<Key, number>, op: Op): LWWMap<Key, number> {
   return op.kind === "set"
@@ -80,7 +80,7 @@ describe("LWWMap convergence", () => {
       }))),
       fc.array(
         fc.tuple(fc.nat(REPLICA_IDS.length - 1), fc.nat(REPLICA_IDS.length - 1)),
-        { maxLength: 20 },
+        { maxLength: 20, size: "max" },
       ),
       fc.tuple(...REPLICA_IDS.map(() => permutation(REPLICA_IDS.length))),
     ),
