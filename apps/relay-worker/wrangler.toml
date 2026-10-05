@@ -1,6 +1,6 @@
 name = "crdt-relay"
 main = "src/index.ts"
-compatibility_date = "2026-09-01"
+compatibility_date = "2026-08-01"
 
 [[durable_objects.bindings]]
 name = "DOCUMENT_DO"

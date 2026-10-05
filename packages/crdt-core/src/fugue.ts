@@ -145,6 +145,25 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
     return new Map(this.vv);
   }
 
+  /** Number of ops applied from `replicaId`. */
+  appliedCount(replicaId: string): number {
+    return this.vv.get(replicaId) ?? 0;
+  }
+
+  /** True iff the op with this dot has already been applied (a re-delivery would be a no-op). */
+  hasApplied(id: Id): boolean {
+    return (this.vv.get(id.replicaId) ?? 0) > id.counter;
+  }
+
+  /**
+   * True iff `applyRemoteOp(op)` would apply the op right now rather than drop it
+   * as a duplicate or buffer it. Throws on a malformed op.
+   */
+  isDeliverable(op: FugueOp): boolean {
+    if (op.id.counter !== (this.vv.get(op.id.replicaId) ?? 0)) return false;
+    return this.missingDependency(op) === null;
+  }
+
   // ---------------------------------------------------------------- local edits
 
   insert(index: number, char: string): FugueInsertOp {

@@ -1,3 +1,5 @@
+import type { DocumentDO } from "./document-do";
+
 export interface Env {
-  DOCUMENT_DO: DurableObjectNamespace;
+  DOCUMENT_DO: DurableObjectNamespace<DocumentDO>;
 }

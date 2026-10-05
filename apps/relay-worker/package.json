@@ -7,13 +7,20 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "build:check": "wrangler deploy --dry-run --outdir dist",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+    "test": "vitest run"
   },
   "dependencies": {
     "@crdt/core": "workspace:*"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.22.0",
     "@cloudflare/workers-types": "^5.20260924.1",
+    "vitest": "^4.1.0",
     "wrangler": "^4.139.0"
+  },
+  "exports": {
+    "./client": "./src/client.ts",
+    "./protocol": "./src/protocol.ts"
   }
 }
