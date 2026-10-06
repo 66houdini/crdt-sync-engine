@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CRDT relay demo</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        max-width: 46rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      h1 {
+        font-size: 1.2rem;
+        margin: 0 0 0.25rem;
+      }
+      p {
+        margin: 0 0 1rem;
+        opacity: 0.75;
+      }
+      .bar {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-bottom: 0.5rem;
+      }
+      #status {
+        flex: 1;
+        font: 0.85rem ui-monospace, monospace;
+      }
+      #status::before {
+        content: "●  ";
+        color: #c0392b;
+      }
+      #status[data-state="online"]::before {
+        color: #27ae60;
+      }
+      button {
+        font: inherit;
+        padding: 0.3rem 0.8rem;
+      }
+      textarea {
+        width: 100%;
+        height: 60vh;
+        box-sizing: border-box;
+        font: 1rem/1.5 ui-monospace, monospace;
+        padding: 0.75rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Document <code id="doc"></code></h1>
+    <p>
+      Open this page in a second tab and type in both. Use the button to drop the connection, keep typing, then
+      reconnect: the edits merge. Add <code>?doc=name</code> to the address for a different document.
+    </p>
+    <div class="bar">
+      <span id="status"></span>
+      <button id="toggle" type="button">Go offline</button>
+    </div>
+    <textarea id="editor" spellcheck="false" autofocus aria-label="Shared document"></textarea>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

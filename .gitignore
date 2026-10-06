@@ -5,3 +5,4 @@ coverage/
 *.log
 .dev.vars
 packages/crdt-core/bench/.data/
+apps/relay-worker/public/app.js

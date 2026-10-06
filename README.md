@@ -6,7 +6,53 @@ Durable Object over WebSockets. Correctness is established by property tests, di
 tests against the published algorithm, and a deterministic, seeded network simulator rather
 than by manual testing.
 
-This is an engine, not a product: no auth, no UI framework, one bare CLI client.
+This is an engine, not a product: no auth, no UI framework, a CLI client and one bare HTML page.
+
+## Highlights
+
+- **Checked against the paper, not against itself.** FugueMax is differentially tested
+  against a naive transcription of the published pseudocode: identical ops and identical
+  text at every step, plus the paper's own worked examples. Each test was confirmed to fail
+  when a specific bug is planted.
+- **Every failure is replayable.** The simulator drives N replicas through reordering,
+  duplication and partitions from a single seed. The fuzzer runs 2000 seeds in CI and prints
+  the failing one; `pnpm sim --seed <n>` reproduces it byte for byte.
+- **Matches the paper's size on a real editing trace.** Replaying 259,778 real keystrokes,
+  the tree metadata is 60% of the text size, the figure the paper reports for its optimized
+  implementation. The full saved document is 193 kB for 105 kB of text.
+
+### What a run looks like
+
+Two clients type at the same position at once; one is cut off mid-edit and keeps typing;
+it reconnects and everything reconciles (`pnpm --filter @crdt/demo-client smoke`, output
+captured from a local relay):
+
+```text
+1. concurrent typing at the same position
+   alice: "the quick brown fox "
+   bob:   "the quick brown fox "
+2. bob's connection is killed mid-edit; both keep typing
+   alice: "> the quick brown fox jum"
+   bob:   "the quick brown fox jumps" (offline, 15 unacked)
+3. bob reconnects
+   alice: "> the quick brown fox jumps"
+   bob:   "> the quick brown fox jumps"
+   relay: "> the quick brown fox jumps"
+OK: clients and relay converged
+```
+
+One seeded simulation: five replicas, 447 deliveries of which 315 arrived out of order and
+27 were duplicates, five partitions, and every replica ends identical:
+
+```text
+$ pnpm sim --seed 12345
+seed=12345 crdt=fugue replicas=5 steps=119
+inserts=100 deletes=5 delivered=447 duplicated=27 reordered=315 partitions=5 max-buffered=57 max-in-flight=205
+r0: "yawzorwjhebttayednrltlgmhumulzypwkjpfvbgszuwlfutapelggnsastyhrfmtpwywssioewajpqjxuptvaetcehdtea"
+...
+r4: "yawzorwjhebttayednrltlgmhumulzypwkjpfvbgszuwlfutapelggnsastyhrfmtpwywssioewajpqjxuptvaetcehdtea"
+CONVERGED
+```
 
 ## Layout
 
@@ -15,7 +61,7 @@ This is an engine, not a product: no auth, no UI framework, one bare CLI client.
 | `packages/crdt-core` | Pure TypeScript CRDTs: `LWWRegister`, `LWWMap`, `RGA`, `FugueMax`, plus a seeded PRNG and a compact binary codec. No DOM, Node or Cloudflare dependencies (its sources compile with `lib: ["ES2022"]`, `types: []`). |
 | `packages/sim` | Deterministic in-process network simulator and convergence fuzzer. Depends only on `crdt-core`. |
 | `apps/relay-worker` | Cloudflare Worker and `DocumentDO`, a SQLite-backed Durable Object using the WebSocket Hibernation API. |
-| `apps/demo-client` | A small CLI client and a scripted end-to-end smoke test. |
+| `apps/demo-client` | A small CLI client, a scripted end-to-end smoke test, and the source of the browser page the relay serves. |
 
 ## Commands
 
@@ -34,13 +80,22 @@ No global pnpm? Use `corepack pnpm <cmd>`; the version is pinned through `packag
 (Corepack 0.30, bundled with some Node 22 releases, fails a signature check; set
 `COREPACK_INTEGRITY_KEYS=0` or update corepack.)
 
-To try the relay by hand:
+To try the relay by hand, start it and open http://127.0.0.1:8787/ in two browser tabs:
 
 ```bash
-pnpm --filter @crdt/relay-worker dev                                   # terminal 1
+pnpm --filter @crdt/relay-worker dev
+```
+
+The page is a single textarea bound to a FugueMax replica (20 kB of JavaScript, no
+framework). Type in both tabs, press "Go offline" in one, keep typing in both, then
+reconnect. Add `?doc=name` for a separate document.
+
+The same thing from the terminal:
+
+```bash
 pnpm --filter @crdt/demo-client start --doc demo --replica alice    # terminal 2
 pnpm --filter @crdt/demo-client start --doc demo --replica bob      # terminal 3
-pnpm --filter @crdt/demo-client smoke                                  # or the scripted check
+pnpm --filter @crdt/demo-client smoke                               # or the scripted check
 ```
 
 In the CLI: `a <text>` appends, `i <index> <text>` inserts, `d <index> [count]` deletes,
@@ -220,7 +275,7 @@ Measured on one Windows 11 laptop, Node 22.13, median of 7 runs after 2 warm-ups
 | | This implementation | Paper: Fugue (optimized) | Paper: FugueMax Simple |
 | --- | --- | --- | --- |
 | Saved document | 193.0 kB | 168 kB | 1,237 kB |
-| CRDT metadata relative to the 105 kB text | 84% (88.2 kB) | 60% | about 1080% |
+| CRDT metadata relative to the 105 kB text | 84% (88.1 kB) | 60% | about 1080% |
 | Local edits | about 320,000 ops/s | 94,000 ops/s | 16,000 ops/s |
 | Remote ops applied | about 750,000 ops/s | not reported separately | not reported separately |
 
@@ -229,11 +284,11 @@ Paper figures are from its Tables II and III, measured on different hardware (a 
 171,000 local ops/s while the machine was busy; treat the throughput as approximate.
 
 **Does it land in the paper's range?** Yes for the tree itself, and slightly above overall,
-for a specific reason. The 88.2 kB of metadata breaks down as:
+for a specific reason. The 88.1 kB of metadata breaks down as:
 
 | Section | Size |
 | --- | --- |
-| Tree structure (ids, parents, sides, right origins) in 10,824 runs | 58.6 kB |
+| Tree structure (ids, parents, sides, right origins) in 10,811 runs | 58.6 kB |
 | Tombstone flags | 3.8 kB |
 | Ids of the delete operations | 25.7 kB |
 
@@ -243,7 +298,7 @@ store. This implementation keeps them because garbage collection needs to know w
 made an element a tombstone in order to decide when that delete is stable. Without GC they
 could be dropped and the saved size would be about 167 kB.
 
-The encoding gets there by storing runs of ordinary typing once, encoding parent and right
+The encoding gets there by storing runs of typing once (left-to-right and right-to-left alike), encoding parent and right
 origin references as positions relative to the run (the common cases take no bytes), and
 keeping text, tombstone flags and delete ids in separate run-length-encoded streams. Deleted
 characters are not stored at all. For comparison the JSON form of the same state is 22 MB.

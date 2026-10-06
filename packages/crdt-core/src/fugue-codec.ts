@@ -9,7 +9,10 @@ import type { FugueJSON, FugueNodeJSON, Side } from "./fugue";
  *  - Runs. Left-to-right typing produces consecutive elements with the same
  *    author, consecutive counters, each the right child of the one before, all
  *    with the same right origin. Such a run is stored once: author, first
- *    counter, length, and where the head hangs.
+ *    counter, length, and where the head hangs. Right-to-left typing (each
+ *    character inserted in front of the previous one) produces the mirror image:
+ *    descending counters, each element the left child of the one after it. That
+ *    is stored as a backward run, anchored at its last element.
  *  - Positional references. Parents and right origins are stored as a distance
  *    in list order from the run, and the common cases (the element just before
  *    the run, the element just after it, the root, the end) take no bytes at all.
@@ -27,6 +30,7 @@ const SIDE_LEFT = 1;
 const PARENT_SHIFT = 1; // 2 bits
 const ORIGIN_SHIFT = 3; // 2 bits
 const SAME_REPLICA = 1 << 5;
+const BACKWARD = 1 << 6;
 
 const enum ParentMode {
   Explicit = 0,
@@ -245,28 +249,59 @@ export function encodeFugueState(state: FugueJSON, breakdown?: FugueEncodingBrea
     return i;
   };
 
-  const runStarts: number[] = [];
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i] as FugueNodeJSON;
-    const prev = nodes[i - 1];
-    const head = nodes[runStarts[runStarts.length - 1] ?? 0] as FugueNodeJSON;
-    const continues =
-      prev !== undefined &&
-      node.side === "right" &&
-      node.id[0] === prev.id[0] &&
-      node.id[1] === prev.id[1] + 1 &&
-      sameId(node.parent, prev.id) &&
-      sameId(node.rightOrigin, head.rightOrigin);
-    if (!continues) runStarts.push(i);
+  // Forward run: each element is the right child of the one before it, with the
+  // next counter and the head's right origin.
+  const forwardEnd = (start: number): number => {
+    const head = nodes[start] as FugueNodeJSON;
+    let end = start + 1;
+    for (; end < nodes.length; end++) {
+      const node = nodes[end] as FugueNodeJSON;
+      const prev = nodes[end - 1] as FugueNodeJSON;
+      if (
+        node.side !== "right" ||
+        node.id[0] !== prev.id[0] ||
+        node.id[1] !== prev.id[1] + 1 ||
+        !sameId(node.parent, prev.id) ||
+        !sameId(node.rightOrigin, head.rightOrigin)
+      ) {
+        break;
+      }
+    }
+    return end;
+  };
+  // Backward run: each element is a left child of the one after it and was typed just after it.
+  const backwardEnd = (start: number): number => {
+    let end = start + 1;
+    for (; end < nodes.length; end++) {
+      const node = nodes[end - 1] as FugueNodeJSON;
+      const next = nodes[end] as FugueNodeJSON;
+      if (node.side !== "left" || node.id[0] !== next.id[0] || node.id[1] !== next.id[1] + 1 || !sameId(node.parent, next.id)) break;
+    }
+    return end;
+  };
+
+  const runs: { start: number; end: number; backward: boolean }[] = [];
+  for (let start = 0; start < nodes.length; ) {
+    let end = forwardEnd(start);
+    let backward = false;
+    if (end === start + 1) {
+      const candidate = backwardEnd(start);
+      if (candidate > end) {
+        end = candidate;
+        backward = true;
+      }
+    }
+    runs.push({ start, end, backward });
+    start = end;
   }
 
   w.varint(nodes.length);
-  w.varint(runStarts.length);
+  w.varint(runs.length);
   let previousReplica = -1;
   let previousCounter = 0;
-  runStarts.forEach((start, r) => {
-    const end = runStarts[r + 1] ?? nodes.length;
-    const head = nodes[start] as FugueNodeJSON;
+  for (const { start, end, backward } of runs) {
+    // The element that carries the run's own parent, side and right origin, and its lowest counter.
+    const head = nodes[backward ? end - 1 : start] as FugueNodeJSON;
     const parent = refIndex(head.parent);
     const origin = refIndex(head.rightOrigin);
     const after = end < nodes.length ? end : -2; // -2: no such element
@@ -281,7 +316,8 @@ export function encodeFugueState(state: FugueJSON, breakdown?: FugueEncodingBrea
       (head.side === "left" ? SIDE_LEFT : 0) |
         (parentMode << PARENT_SHIFT) |
         (originMode << ORIGIN_SHIFT) |
-        (replica === previousReplica ? SAME_REPLICA : 0),
+        (replica === previousReplica ? SAME_REPLICA : 0) |
+        (backward ? BACKWARD : 0),
     );
     if (replica !== previousReplica) w.varint(replica);
     w.signed(head.id[1] - previousCounter);
@@ -290,7 +326,7 @@ export function encodeFugueState(state: FugueJSON, breakdown?: FugueEncodingBrea
     if (originMode === OriginMode.Explicit) w.signed(origin - start);
     previousReplica = replica;
     previousCounter = head.id[1];
-  });
+  }
 
   const structureEnd = w.length;
 
@@ -362,7 +398,7 @@ export function encodeFugueState(state: FugueJSON, breakdown?: FugueEncodingBrea
   if (breakdown !== undefined) {
     breakdown.header = headerEnd;
     breakdown.structure = structureEnd - headerEnd;
-    breakdown.runs = runStarts.length;
+    breakdown.runs = runs.length;
     breakdown.text = textEnd - structureEnd;
     breakdown.tombstoneFlags = flagsEnd - textEnd;
     breakdown.deleteDots = w.length - flagsEnd;
@@ -415,11 +451,22 @@ export function decodeFugueState(bytes: Uint8Array): FugueJSON {
       originMode === OriginMode.End ? -1 : originMode === OriginMode.Parent ? parent : originMode === OriginMode.AfterRun ? after : start + r.signed();
 
     const name = replicaAt(replica);
-    for (let k = 0; k < length; k++) {
-      ids.push([name, counter + k]);
-      sides.push(k === 0 && (header & SIDE_LEFT) !== 0 ? "left" : "right");
-      parents.push(k === 0 ? parent : start + k - 1);
-      origins.push(origin);
+    const side: Side = (header & SIDE_LEFT) !== 0 ? "left" : "right";
+    if ((header & BACKWARD) !== 0) {
+      for (let k = 0; k < length; k++) {
+        const anchor = k === length - 1;
+        ids.push([name, counter + (length - 1 - k)]);
+        sides.push(anchor ? side : "left");
+        parents.push(anchor ? parent : start + k + 1);
+        origins.push(anchor ? origin : start + k + 1);
+      }
+    } else {
+      for (let k = 0; k < length; k++) {
+        ids.push([name, counter + k]);
+        sides.push(k === 0 ? side : "right");
+        parents.push(k === 0 ? parent : start + k - 1);
+        origins.push(origin);
+      }
     }
     previousReplica = replica;
     previousCounter = counter;

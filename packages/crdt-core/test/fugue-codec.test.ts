@@ -79,6 +79,36 @@ describe("FugueMax binary encoding", () => {
     expect(FugueMax.decode(bytes, "reader").toString()).toBe(text);
   });
 
+  it("stores right-to-left typing as compactly as left-to-right typing", () => {
+    const text = "The quick brown fox jumps over the lazy dog. ".repeat(100);
+    const forward = new FugueMax("writer");
+    forward.insertText(0, text);
+    const backward = new FugueMax("writer");
+    for (const ch of [...text].reverse()) backward.insert(0, ch);
+    expect(backward.toString()).toBe(text);
+
+    const bytes = backward.encode();
+    expect(bytes.length).toBeLessThan(text.length + 40);
+    expect(Math.abs(bytes.length - forward.encode().length)).toBeLessThan(8);
+    expect(FugueMax.decode(bytes, "reader").toJSON()).toEqual(backward.toJSON());
+  });
+
+  it("round-trips documents that mix forward runs, backward runs and concurrent siblings", () => {
+    const a = new FugueMax("a");
+    const b = new FugueMax("b");
+    const base = a.insertText(0, "[]");
+    for (const op of base) b.applyRemoteOp(op);
+    const fromA: FugueOp[] = [..."olleh"].map((ch) => a.insert(1, ch)); // "hello", typed backward
+    fromA.push(...a.insertText(6, " there")); // then forward from its end
+    const fromB: FugueOp[] = [..."dlrow"].map((ch) => b.insert(1, ch)); // concurrent backward run
+    for (const op of fromB) a.applyRemoteOp(op);
+    for (const op of fromA) b.applyRemoteOp(op);
+    expect(a.toString()).toBe(b.toString());
+    expect(a.toString()).toContain("hello there");
+    expect(a.toString()).toContain("world");
+    expect(FugueMax.decode(a.encode(), "reader").toJSON()).toEqual(a.toJSON());
+  });
+
   it("stores held-down backspace as one run of delete dots", () => {
     const doc = new FugueMax("writer");
     doc.insertText(0, "x".repeat(2000));

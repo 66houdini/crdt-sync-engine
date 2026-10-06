@@ -6,7 +6,8 @@
   "scripts": {
     "start": "tsx src/cli.ts",
     "smoke": "tsx src/smoke.ts",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.web.json",
+    "build:web": "esbuild src/web.ts --bundle --format=esm --target=es2022 --minify --outfile=../relay-worker/public/app.js"
   },
   "dependencies": {
     "@crdt/core": "workspace:*",
@@ -14,6 +15,7 @@
   },
   "devDependencies": {
     "@types/node": "^22",
+    "esbuild": "^0.28.2",
     "tsx": "^4.23.15"
   }
 }

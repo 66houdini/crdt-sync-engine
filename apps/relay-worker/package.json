@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "build:check": "wrangler deploy --dry-run --outdir dist",
+    "dev": "pnpm build:web && wrangler dev",
+    "deploy": "pnpm build:web && wrangler deploy",
+    "build:check": "pnpm build:web && wrangler deploy --dry-run --outdir dist",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:web": "pnpm --filter @crdt/demo-client build:web"
   },
   "dependencies": {
     "@crdt/core": "workspace:*"
