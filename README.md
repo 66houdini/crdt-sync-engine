@@ -143,8 +143,7 @@ tests confirm that it catches a non-convergent list and a non-idempotent CRDT, a
 bugs in FugueMax were found within the first two seeds and reproduced from the printed seed.
 
 CI (`.github/workflows/ci.yml`) runs typecheck, all tests, the FugueMax fuzz, the fuzz with
-garbage collection, the RGA fuzz and a worker bundle check on every push. The workflow has
-not been run on GitHub yet; every step in it was run locally.
+garbage collection, the RGA fuzz and a worker bundle check on every push.
 
 ## Relay (`DocumentDO`)
 
@@ -256,9 +255,9 @@ characters are not stored at all. For comparison the JSON form of the same state
   included). If the 10 ms per-invocation CPU budget applies to a cold start, that bounds a
   document at a few thousand elements. This has not been measured on Cloudflare, and local
   workerd does not enforce CPU limits. A lazily loaded or chunked document would lift it.
-- **Not deployed.** Everything was verified locally: unit and property tests, the relay
-  tests in workerd, and an end-to-end run of the demo client against `wrangler dev`. Nothing
-  has been deployed to a Cloudflare account, and the CI workflow has not run on GitHub.
+- **Not deployed.** Everything was verified locally and in CI: unit and property tests, the
+  relay tests in workerd, the fuzzers, and (locally only) an end-to-end run of the demo
+  client against `wrangler dev`. Nothing has been deployed to a Cloudflare account.
 - **Hard relay crashes.** Ops that were broadcast but not yet flushed (at most two seconds'
   worth) survive only if their author is still connected to resend them. A local op that
   depended on such a lost op from someone else is dropped during resync.
