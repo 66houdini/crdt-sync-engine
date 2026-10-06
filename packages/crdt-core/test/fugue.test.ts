@@ -435,6 +435,48 @@ describe("FugueMax at scale", () => {
   });
 });
 
+describe("FugueMax stable cursors", () => {
+  it("idBefore and caretAfter are inverses on a quiet document", () => {
+    fc.assert(
+      fc.property(scenarioArb, fc.nat(1000), (scenario, pos) => {
+        const doc = runScenario(factory, scenario).replicas[0] as FugueMax;
+        const index = pos % (doc.length + 1);
+        expect(doc.caretAfter(doc.idBefore(index))).toBe(index);
+      }),
+    );
+  });
+
+  it("a cursor follows its character through concurrent edits and survives its deletion", () => {
+    const a = new FugueMax("a");
+    const b = new FugueMax("b");
+    const typed = a.insertText(0, "hello world");
+    deliverAll(b, typed);
+
+    const cursor = a.idBefore(5); // just after "hello"
+    const ops: FugueOp[] = [...b.insertText(0, ">> "), b.delete(3 + 6), ...b.insertText(b.length, "!")];
+    deliverAll(a, ops);
+    expect(a.toString()).toBe(">> hello orld!");
+    expect(a.caretAfter(cursor)).toBe(8);
+    expect(a.toString().slice(0, a.caretAfter(cursor))).toBe(">> hello");
+
+    // Delete the character the cursor is attached to: it stays where that character was.
+    a.delete(7);
+    expect(a.toString()).toBe(">> hell orld!");
+    expect(a.caretAfter(cursor)).toBe(7);
+    expect(a.caretAfter(null)).toBe(0);
+    expect(a.caretAfter({ replicaId: "nobody", counter: 0 })).toBe(0);
+    expect(() => a.idBefore(99)).toThrow(RangeError);
+  });
+
+  it("resolves cursors correctly across chunk boundaries", () => {
+    const doc = new FugueMax("a");
+    doc.insertText(0, "x".repeat(3000));
+    for (const index of [0, 1, 511, 512, 513, 1500, 2999, 3000]) {
+      expect(doc.caretAfter(doc.idBefore(index))).toBe(index);
+    }
+  });
+});
+
 describe("FugueMax serialization", () => {
   it("round-trips through JSON and the restored replica keeps converging", () => {
     fc.assert(

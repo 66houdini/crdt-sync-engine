@@ -94,6 +94,14 @@ class TestClient {
     this.push(this.session.delete(index, count));
   }
 
+  caret(index: number): void {
+    this.push([this.session.presence(index)]);
+  }
+
+  errors(): string[] {
+    return this.received.flatMap((m) => (m.type === "error" ? [m.message] : []));
+  }
+
   disconnect(): void {
     this.ws?.close(1000, "bye");
     this.ws = null;
@@ -110,7 +118,8 @@ class TestClient {
 
 const serverText = async (docId: string): Promise<string> => (await SELF.fetch(`https://relay.test/doc/${docId}/text`)).text();
 const serverStats = async (docId: string) =>
-  (await (await SELF.fetch(`https://relay.test/doc/${docId}/stats`)).json()) as Record<string, number>;
+  (await (await SELF.fetch(`https://relay.test/doc/${docId}/stats`)).json()) as Record<string, unknown>;
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 const batchRows = (docId: string): Promise<number> =>
   runInDurableObject(stubFor(docId), (_instance, state) =>
     Number(state.storage.sql.exec("SELECT COUNT(*) AS c FROM op_batches").one().c),
@@ -304,6 +313,178 @@ describe("DocumentDO relay", () => {
     expect(await keys()).toContain(`${docId}/snapshot-000000000036.fgm`);
     await evictDurableObject(stubFor(docId));
     expect(await serverText(docId)).toBe(expected + "e".repeat(12) + "f".repeat(12));
+  });
+
+  it("serves connections and stats after a cold start without rebuilding the document", async () => {
+    const docId = freshDocId();
+    const alice = await TestClient.open(docId, "alice");
+    alice.type(0, "lazy relay");
+    await untilAsync(async () => (await serverStats(docId)).seq === 10, "applied");
+    await runDurableObjectAlarm(stubFor(docId));
+    await until(() => alice.session.unackedCount === 0, "flushed");
+    alice.disconnect();
+    await evictDurableObject(stubFor(docId));
+
+    // Reads are answered from the summary row, the stored snapshot and the log.
+    expect((await serverStats(docId)).materialized).toBe(false);
+    const bob = await TestClient.open(docId, "bob");
+    expect(bob.text).toBe("lazy relay");
+    await alice.connect(); // incremental reconnect
+    expect(alice.text).toBe("lazy relay");
+    const stats = await serverStats(docId);
+    expect(stats.materialized).toBe(false);
+    expect(stats.length).toBe(10);
+    expect(stats.seq).toBe(10);
+
+    // The first op that has to be validated builds the document.
+    bob.type(10, "!");
+    await until(() => alice.text === "lazy relay!", "relayed");
+    expect((await serverStats(docId)).materialized).toBe(true);
+    expect(await serverText(docId)).toBe("lazy relay!");
+  });
+
+  it("a client's unconfirmed edits survive a full state transfer that arrives as snapshot plus later ops", async () => {
+    // Snapshot every 30 ops: after 36 ops the stored snapshot is behind the log by nothing,
+    // after 48 it is behind by 12, so a full sync is "snapshot at 36, then ops 37..48".
+    const docId = freshDocId();
+    const alice = await TestClient.open(docId, "alice");
+    for (let n = 1; n <= 4; n++) {
+      alice.type(alice.text.length, String(n).repeat(12));
+      await untilAsync(async () => (await serverStats(docId)).seq === n * 12, `burst ${n}`);
+      await runDurableObjectAlarm(stubFor(docId));
+      await until(() => alice.session.unackedCount === 0, `burst ${n} acked`);
+    }
+    expect((await serverStats(docId)).snapshotSeq).toBe(36);
+
+    // Bob syncs, goes offline, and types right after the newest text (which is not in the snapshot).
+    const bob = await TestClient.open(docId, "bob");
+    bob.disconnect();
+    bob.type(48, " <- bob was here");
+    // Force bob through a full state transfer on his next connection.
+    await runInDurableObject(stubFor(docId), (instance) => {
+      (instance as unknown as { epoch: number }).epoch = 7;
+    });
+    await bob.connect();
+    expect(bob.count("snapshot")).toBe(2);
+    await until(() => alice.text === bob.text && bob.text.endsWith("444444444444 <- bob was here"), "bob's edits were kept and relayed");
+    expect(await serverText(docId)).toBe(bob.text);
+  });
+
+  it("stops accepting inserts when a document is full", async () => {
+    const docId = freshDocId(); // limit in the test configuration: 1000 elements
+    const alice = await TestClient.open(docId, "alice");
+    for (let round = 1; round <= 3; round++) {
+      alice.type(alice.text.length, "x".repeat(390));
+      const expected = Math.min(1000, round * 390);
+      await untilAsync(async () => (await serverStats(docId)).seq === expected, `round ${round}`);
+      await pause(1100); // let the rate limiter refill
+    }
+    const stats = await serverStats(docId);
+    expect(stats.length).toBe(1000);
+    expect(alice.errors().some((e) => e.includes("document is full"))).toBe(true);
+    // The writer whose insert was refused is stuck: its later ops would leave a gap.
+    alice.erase(0, 1);
+    await until(() => alice.errors().some((e) => e.includes("out of order")), "later ops from the same writer are refused");
+    expect((await serverStats(docId)).seq).toBe(1000);
+
+    // Other clients can still delete, which frees nothing: tombstones count towards the limit.
+    const bob = await TestClient.open(docId, "bob");
+    expect(bob.text.length).toBe(1000);
+    bob.erase(0, 5);
+    await untilAsync(async () => (await serverStats(docId)).seq === 1005, "deletes accepted");
+    expect((await serverStats(docId)).length).toBe(995);
+    bob.type(0, "z");
+    await until(() => bob.errors().some((e) => e.includes("document is full")), "still full");
+  });
+
+  it("rate-limits a flood, and the client's edits still all arrive once it reconnects", async () => {
+    const docId = freshDocId(); // burst in the test configuration: 400 ops
+    const alice = await TestClient.open(docId, "alice");
+    const bob = await TestClient.open(docId, "bob");
+    alice.type(0, "y".repeat(500));
+    await until(() => alice.closeCode === 4008, "closed for flooding");
+    expect(alice.errors().some((e) => e.includes("rate limited"))).toBe(true);
+    const accepted = (await serverStats(docId)).seq as number;
+    expect(accepted).toBeGreaterThan(300);
+    expect(accepted).toBeLessThan(500);
+
+    await pause(1200);
+    await alice.connect(); // resends what was never accepted
+    await untilAsync(async () => (await serverStats(docId)).seq === 500, "the rest arrived");
+    await runDurableObjectAlarm(stubFor(docId));
+    await until(() => alice.session.unackedCount === 0, "acked");
+    await until(() => bob.text.length === 500, "bob has all of it");
+    expect(bob.text).toBe(alice.text);
+  });
+
+  it("deletes a document that has been idle past its time-to-live", async () => {
+    const docId = freshDocId();
+    const alice = await TestClient.open(docId, "alice");
+    alice.type(0, "temporary");
+    await untilAsync(async () => (await serverStats(docId)).seq === 9, "applied");
+    await runDurableObjectAlarm(stubFor(docId));
+    await until(() => alice.session.unackedCount === 0, "flushed");
+
+    // Not yet due: an alarm that fires early changes nothing.
+    await runDurableObjectAlarm(stubFor(docId));
+    expect(await serverText(docId)).toBe("temporary");
+
+    // Pretend the last activity was two hours ago (the configured TTL is one hour).
+    alice.disconnect();
+    await untilAsync(async () => (await serverStats(docId)).connections === 0, "disconnected");
+    await runInDurableObject(stubFor(docId), async (instance, state) => {
+      const past = Date.now() - 2 * 3600_000;
+      (instance as unknown as { lastActive: number }).lastActive = past;
+      await state.storage.setAlarm(past + 3600_000);
+    });
+    await untilAsync(async () => (await serverStats(docId)).seq === 0, "expired");
+    expect(await serverText(docId)).toBe("");
+    expect(
+      await runInDurableObject(stubFor(docId), (_i, state) => Number(state.storage.sql.exec("SELECT COUNT(*) AS c FROM op_batches").one().c)),
+    ).toBe(0);
+
+    // A client that remembers the old document is reset to the empty one.
+    await alice.connect();
+    expect(alice.text).toBe("");
+  });
+
+  it("relays carets as stable cursors, tells newcomers who is here, and announces departures", async () => {
+    const docId = freshDocId();
+    const alice = await TestClient.open(docId, "alice");
+    const bob = await TestClient.open(docId, "bob");
+    alice.type(0, "hello");
+    await until(() => bob.text === "hello", "text relayed");
+    alice.caret(5);
+    await until(() => bob.session.peerCarets().length === 1, "bob sees alice");
+    expect(bob.session.peerCarets()).toEqual([{ replicaId: "alice", index: 5 }]);
+
+    // Bob types in front: alice's caret, as bob sees it, moves with her text.
+    bob.type(0, ">> ");
+    expect(bob.session.peerCarets()).toEqual([{ replicaId: "alice", index: 8 }]);
+
+    // Presence survives hibernation (it lives in the socket attachment) and reaches newcomers.
+    await untilAsync(async () => (await serverStats(docId)).seq === 8, "applied");
+    await runDurableObjectAlarm(stubFor(docId));
+    await until(() => bob.session.unackedCount === 0, "flushed");
+    await evictDurableObject(stubFor(docId));
+    const carol = await TestClient.open(docId, "carol");
+    expect(carol.session.peerCarets()).toEqual([{ replicaId: "alice", index: 8 }]);
+
+    alice.disconnect();
+    await until(() => bob.session.peerCarets().length === 0 && carol.session.peerCarets().length === 0, "alice left");
+  });
+
+  it("detects a lost buffer even when the orphaned alarm is what wakes the object", async () => {
+    const docId = freshDocId();
+    const alice = await TestClient.open(docId, "alice");
+    alice.type(0, "volatile");
+    await untilAsync(async () => (await serverStats(docId)).buffered === 8, "buffered, not flushed");
+    await evictDurableObject(stubFor(docId));
+    await runDurableObjectAlarm(stubFor(docId));
+    await until(() => alice.count("resync") === 1, "told to resync");
+    await until(() => alice.synced, "reconnected");
+    await untilAsync(async () => (await serverText(docId)) === "volatile", "resent");
+    expect((await serverStats(docId)).epoch).toBe(1);
   });
 
   it("rejects malformed and spoofed ops without disturbing the document", async () => {

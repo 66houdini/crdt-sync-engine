@@ -24,7 +24,14 @@ new_sqlite_classes = ["DocumentDO"]
 # binding = "SNAPSHOT_ARCHIVE"
 # bucket_name = "crdt-relay-snapshots"
 
-# Optional compaction thresholds (defaults: snapshot every 5000 ops, keep a 1000-op log tail).
-# [vars]
+# Limits for the public demo. Every value is optional; src/document-do.ts has the defaults
+# (keep documents forever, 500000 elements, 64 connections, 3000-op burst refilled at 300/s,
+# snapshot every 5000 ops with a 1000-op log tail).
+[vars]
+DOC_TTL_SECONDS = "604800"    # delete a document after 7 idle days
+MAX_DOC_ELEMENTS = "200000"   # live characters plus tombstones
+# MAX_CONNECTIONS = "64"
+# RATE_BURST = "3000"
+# RATE_PER_SECOND = "300"
 # SNAPSHOT_EVERY_OPS = "5000"
 # LOG_TAIL_OPS = "1000"

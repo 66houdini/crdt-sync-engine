@@ -623,6 +623,35 @@ export class FugueMax implements SequenceCrdt<FugueOp> {
     return parts.join("");
   }
 
+  /**
+   * A stable cursor: the id of the visible character just before caret position
+   * `index`, or `null` for the start of the document. Unlike an index it keeps
+   * meaning as other replicas insert and delete around it; see `caretAfter`.
+   */
+  idBefore(index: number): Id | null {
+    if (!Number.isInteger(index) || index < 0 || index > this.visible) {
+      throw new RangeError(`FugueMax.idBefore index ${index} out of range [0, ${this.visible}]`);
+    }
+    return index === 0 ? null : this.visibleAt(index - 1).id;
+  }
+
+  /**
+   * Resolves a stable cursor back to a caret position: just after the element
+   * `id` if it is still visible, or where it used to be if it has been deleted.
+   * `null` (and an id this replica does not hold) resolves to the start.
+   */
+  caretAfter(id: Id | null): number {
+    const node = id === null ? undefined : this.lookup(id);
+    if (node === undefined) return 0;
+    let caret = 0;
+    for (let c: Chunk | null = this.head; c !== null && c !== node.chunk; c = c.next) caret += c.visible;
+    for (const other of node.chunk.nodes) {
+      if (!other.deleted) caret++;
+      if (other === node) break;
+    }
+    return caret;
+  }
+
   /** Ids of the visible characters in order (stable handles for cursors and tests). */
   visibleIds(): Id[] {
     const out: Id[] = [];

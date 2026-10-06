@@ -1,4 +1,4 @@
-import { FugueMax, type FugueOp } from "@crdt/core";
+import { FugueMax, type FugueOp, type Id } from "@crdt/core";
 import type { ClientMessage, ServerMessage } from "./protocol";
 
 const OPS_PER_MESSAGE = 500;
@@ -10,7 +10,15 @@ export interface ReceiveResult {
   reconnect: boolean;
   /** The local document changed. */
   changed: boolean;
+  /** Another client's caret moved, appeared or left. */
+  presenceChanged: boolean;
   error?: string;
+}
+
+export interface PeerCaret {
+  replicaId: string;
+  /** Caret position in the local document, resolved from the peer's stable cursor. */
+  index: number;
 }
 
 /**
@@ -31,6 +39,9 @@ export class ClientSession {
   private epoch: number | null = null;
   private snapshotFrames: Uint8Array[] = [];
   private snapshotFramesExpected = 0;
+  /** A snapshot replaced the document and the local unacknowledged ops are not back in it yet. */
+  private replayPending = false;
+  private readonly peers = new Map<string, Id | null>();
 
   constructor(readonly replicaId: string) {
     this.doc = new FugueMax(replicaId);
@@ -49,16 +60,27 @@ export class ClientSession {
   connectQuery(): string {
     this.snapshotFrames = [];
     this.snapshotFramesExpected = 0;
+    this.peers.clear();
     const params = [`replica=${encodeURIComponent(this.replicaId)}`];
     if (this.since !== null && this.epoch !== null) params.push(`since=${this.since}`, `epoch=${this.epoch}`);
     return params.join("&");
   }
 
   insert(index: number, text: string): ClientMessage[] {
+    this.settleBeforeEdit();
     return this.record(this.doc.insertText(index, text));
   }
 
+  /**
+   * A local edit in the middle of a state transfer must not reuse the op ids of
+   * unconfirmed local ops that are still waiting to be replayed, so replay them now.
+   */
+  private settleBeforeEdit(): void {
+    if (this.replayPending) this.replayUnacked();
+  }
+
   delete(index: number, count = 1): ClientMessage[] {
+    this.settleBeforeEdit();
     const ops: FugueOp[] = [];
     for (let i = 0; i < count; i++) ops.push(this.doc.delete(index));
     return this.record(ops);
@@ -69,13 +91,26 @@ export class ClientSession {
     return chunk(ops);
   }
 
+  /** Announces where the local caret is. The cursor is stable, so peers can place it even after further edits. */
+  presence(caret: number): ClientMessage {
+    return { type: "presence", cursor: this.doc.idBefore(Math.max(0, Math.min(caret, this.doc.length))) };
+  }
+
+  /** Other clients' carets, as positions in the local document right now. */
+  peerCarets(): PeerCaret[] {
+    return [...this.peers].map(([replicaId, cursor]) => ({ replicaId, index: this.doc.caretAfter(cursor) }));
+  }
+
   /** Handles one frame from the relay: a parsed JSON message, or the bytes of a binary frame. */
   receive(message: ServerMessage | Uint8Array): ReceiveResult {
-    const result: ReceiveResult = { send: [], reconnect: false, changed: false };
+    const result: ReceiveResult = { send: [], reconnect: false, changed: false, presenceChanged: false };
     if (message instanceof Uint8Array) {
       this.snapshotFrames.push(message);
       if (this.snapshotFrames.length === this.snapshotFramesExpected) {
-        this.rebuildFrom(FugueMax.decode(concat(this.snapshotFrames), this.replicaId));
+        // Everything the old document held is dropped on purpose: after a relay data
+        // loss it may contain other replicas' ops that no longer exist anywhere.
+        this.doc = FugueMax.decode(concat(this.snapshotFrames), this.replicaId);
+        this.replayPending = true;
         this.snapshotFrames = [];
         this.snapshotFramesExpected = 0;
         result.changed = true;
@@ -94,6 +129,10 @@ export class ClientSession {
         break;
       }
       case "synced": {
+        if (this.replayPending) {
+          this.replayUnacked();
+          result.changed = true;
+        }
         this.confirm(message.seq, message.epoch, message.counter);
         // Everything the relay does not have durably yet goes out again; duplicates are ignored there.
         result.send = chunk(this.unacked);
@@ -101,6 +140,12 @@ export class ClientSession {
       }
       case "ack": {
         this.confirm(message.seq, message.epoch, message.counter);
+        break;
+      }
+      case "presence": {
+        if (message.gone === true) this.peers.delete(message.replicaId);
+        else this.peers.set(message.replicaId, message.cursor);
+        result.presenceChanged = true;
         break;
       }
       case "resync": {
@@ -124,21 +169,21 @@ export class ClientSession {
   }
 
   /**
-   * Replaces the local document with the relay's state and replays the local ops
-   * the relay has not confirmed. Anything else the old document held is dropped on
-   * purpose: after a relay data loss it may contain other replicas' ops that no
-   * longer exist anywhere. A local op that depended on such an op cannot be
-   * replayed; it and the local ops after it are discarded.
+   * Puts the local ops the relay has not confirmed back into a document that was
+   * just rebuilt from the relay's state. This runs at `synced`, once the ops that
+   * followed the snapshot have been applied, because a local op may depend on
+   * them. A local op that still cannot be placed depended on an op the relay
+   * lost; it and the local ops after it are discarded.
    */
-  private rebuildFrom(doc: FugueMax): void {
+  private replayUnacked(): void {
+    this.replayPending = false;
     const kept: FugueOp[] = [];
     for (const op of this.unacked) {
-      if (doc.hasApplied(op.id)) continue;
-      if (!doc.isDeliverable(op)) break;
-      doc.applyRemoteOp(op);
+      if (this.doc.hasApplied(op.id)) continue;
+      if (!this.doc.isDeliverable(op)) break;
+      this.doc.applyRemoteOp(op);
       kept.push(op);
     }
-    this.doc = doc;
     this.unacked = kept;
   }
 }
