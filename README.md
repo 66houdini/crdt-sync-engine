@@ -303,18 +303,43 @@ origin references as positions relative to the run (the common cases take no byt
 keeping text, tombstone flags and delete ids in separate run-length-encoded streams. Deleted
 characters are not stored at all. For comparison the JSON form of the same state is 22 MB.
 
+## Measured on Cloudflare
+
+The relay was deployed to a workers.dev account and exercised with the demo client and
+`pnpm --filter @crdt/demo-client measure`, which builds documents of increasing size (about
+a quarter of the elements deleted again), waits for each Durable Object to be evicted, and
+times the request that wakes it. CPU times are Cloudflare's own, read from `wrangler tail`.
+
+| Elements (live + tombstones) | Cold start, CPU | Cold request, wall clock | Warm request, wall clock |
+| --- | --- | --- | --- |
+| 1,000 | 5 ms | 0.67 s | 0.21 s |
+| 5,000 | 12 ms | 0.67 s | 0.22 s |
+| 20,000 | 35 ms | 0.82 s | 0.23 s |
+| 50,000 | 79 ms | 1.24 s | 0.68 s |
+| 100,000 | 176 ms | 0.97 s | 0.74 s |
+
+Wall-clock figures include a round trip from the test machine and vary with the network
+(the last two rows were taken in a separate session from the first three).
+
+- Rebuilding a document on wake costs about 1.7 µs of CPU per element, linear in size.
+- Ordinary traffic is cheap: across 238 WebSocket message invocations, each carrying up to
+  360 ops, CPU was 1 ms at the median and 8 ms at most.
+- The heaviest single invocation was a compaction of the 100,000-element document: 203 ms
+  CPU. No invocation was terminated for CPU: of 355 logged, 348 were ok and the other 7 were
+  cancelled or disconnected events at 3 ms CPU or less (clients closing sockets).
+- The end-to-end smoke test (concurrent typing, a dropped connection, offline edits,
+  reconnect) passes against the deployed relay, including the alarm-driven flush and acks.
+
+So the cold-start cost that looked like a risk from local numbers is real but small at
+these sizes, and no redesign was needed. It is still linear: a relay that rebuilt nothing
+on wake (serving the stored snapshot and log tail directly, materialising the document only
+to compact) would make it constant, and would be the next step for documents in the
+millions of elements. These are single runs on one account whose plan limits were not
+separately verified, so treat them as observations rather than guarantees.
+
 ## Known limits
 
-- **Free-tier CPU.** Rebuilding the 182,000-element benchmark document from its snapshot
-  takes 250 to 400 ms on the laptop above, roughly 1.5 to 2 µs per element (tombstones
-  included). If the 10 ms per-invocation CPU budget applies to a cold start, that bounds a
-  document at a few thousand elements. This has not been measured on Cloudflare, and local
-  workerd does not enforce CPU limits. A lazily loaded or chunked document would lift it.
-  `pnpm --filter @crdt/demo-client measure --url wss://<worker>.workers.dev` builds documents of
-  increasing size on a deployed relay and times the request that wakes each one from storage.
-- **Not deployed.** Everything was verified locally and in CI: unit and property tests, the
-  relay tests in workerd, the fuzzers, and (locally only) an end-to-end run of the demo
-  client against `wrangler dev`. Nothing has been deployed to a Cloudflare account.
+- **Cold start is linear in document size.** See the measurements above.
 - **Hard relay crashes.** Ops that were broadcast but not yet flushed (at most two seconds'
   worth) survive only if their author is still connected to resend them. A local op that
   depended on such a lost op from someone else is dropped during resync.
