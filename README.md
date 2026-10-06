@@ -7,10 +7,11 @@ tests against the published algorithm, and a deterministic, seeded network simul
 than by manual testing.
 
 This is an engine, not a product: no auth, no UI framework, a CLI client and one bare HTML page.
+[What the tests taught](docs/writeup.md) is a short account of where the plan was wrong.
 
 **Live demo:** https://crdt-relay.oladipupoolatunji272.workers.dev — open it in two tabs and
 type in both; use "Go offline" in one, keep typing, then reconnect. It is an open,
-unauthenticated demo on a free plan, so documents are public and may be reset at any time.
+unauthenticated demo on a free plan: documents are public, and one left idle for a week is deleted.
 
 ## Highlights
 
@@ -90,8 +91,8 @@ To try the relay by hand, start it and open http://127.0.0.1:8787/ in two browse
 pnpm --filter @crdt/relay-worker dev
 ```
 
-The page is a single textarea bound to a FugueMax replica (20 kB of JavaScript, no
-framework). Type in both tabs, press "Go offline" in one, keep typing in both, then
+The page is a single textarea bound to a FugueMax replica (about 22 kB of JavaScript, no
+framework), showing the other tabs' carets. Type in both tabs, press "Go offline" in one, keep typing in both, then
 reconnect. Add `?doc=name` for a separate document.
 
 The same thing from the terminal:
@@ -209,8 +210,11 @@ garbage collection, the RGA fuzz and a worker bundle check on every push.
 One Durable Object per document, addressed by `idFromName(documentId)`.
 
 - **Hibernation.** Uses `ctx.acceptWebSocket` and the `webSocketMessage` / `webSocketClose` /
-  `webSocketError` handlers. Each socket's replica id lives in its attachment, and the
-  document is rebuilt from SQLite in the constructor inside `blockConcurrencyWhile`.
+  `webSocketError` handlers. Each socket's replica id lives in its attachment, and state is
+  read back from SQLite in the constructor inside `blockConcurrencyWhile`.
+- **Cheap wake-ups.** Waking does not rebuild the document. Connecting, reconnecting and
+  reading stats are served from the stored snapshot, the log and one summary row; the
+  document is rebuilt only when an op has to be validated against it, or to compact it.
 - **Batched persistence.** Ops are applied and broadcast immediately but written as one row
   per flush, driven by an alarm two seconds after the first buffered op. A burst of typing
   costs two row writes (the alarm and the batch), not one per keystroke.
@@ -219,8 +223,8 @@ One Durable Object per document, addressed by `idFromName(documentId)`.
   because ops are idempotent.
 - **Reconnects.** Every accepted op gets a per-document sequence number. A returning client
   sends the last durable sequence number it saw and receives just the ops after it; a new
-  client, or one that has fallen behind the retained log, receives a snapshot in the compact
-  binary encoding.
+  client, or one that has fallen behind the retained log, receives the stored snapshot (in
+  the compact binary encoding) followed by the ops made since it was taken.
 - **Lost buffers are detected.** If an instance dies with ops still in memory, its flush
   alarm is left behind. The next instance sees an alarm it did not schedule, bumps the
   document epoch and tells every client to resync from the snapshot and resend. Ops that
@@ -228,6 +232,15 @@ One Durable Object per document, addressed by `idFromName(documentId)`.
   client keeps state the relay cannot reproduce.
 - **Validation.** Op shape, ownership of the op id by the connection's replica,
   deliverability, and frame size are all checked before an op is applied.
+- **Guards.** A token bucket per replica (a connection over its allowance is closed, and the
+  client resends what was not accepted once it reconnects), a cap on document size counting
+  tombstones, and a cap on connections per document.
+- **Idle expiry.** With `DOC_TTL_SECONDS` set, a document untouched for that long deletes
+  itself. It shares the object's single alarm with the flush without weakening lost-buffer
+  detection: the only alarm a healthy document leaves behind is its expiry alarm.
+- **Presence.** Carets are relayed as stable cursors (the id of the character before the
+  caret), so they stay correct as others edit, and are kept in the socket attachment so they
+  survive hibernation. They are never stored.
 - **Snapshots and compaction.** Every 5000 ops the log is folded into a binary snapshot and
   trimmed to a 1000-op tail, so storage grows with the document rather than its history. If
   an R2 bucket is bound as `SNAPSHOT_ARCHIVE`, the replaced snapshot and the dropped log rows
@@ -235,8 +248,8 @@ One Durable Object per document, addressed by `idFromName(documentId)`.
   enabled on the account; without it, compacted data is discarded.
 
 The relay tests run inside workerd through `@cloudflare/vitest-pool-workers` and force real
-evictions with `evictDurableObject`, covering hibernation, the lost-buffer path, compaction,
-R2 archival and both reconnect paths.
+evictions with `evictDurableObject`, covering hibernation, both lost-buffer paths,
+compaction, R2 archival, both reconnect paths, cheap wake-ups, the guards, expiry and presence.
 
 ## Tombstone garbage collection
 
@@ -334,19 +347,35 @@ Wall-clock figures include a round trip from the test machine and vary with the 
 - The end-to-end smoke test (concurrent typing, a dropped connection, offline edits,
   reconnect) passes against the deployed relay, including the alarm-driven flush and acks.
 
-So the cold-start cost that looked like a risk from local numbers is real but small at
-these sizes, and no redesign was needed. It is still linear: a relay that rebuilt nothing
-on wake (serving the stored snapshot and log tail directly, materialising the document only
-to compact) would make it constant, and would be the next step for documents in the
-millions of elements. These are single runs on one account whose plan limits were not
-separately verified, so treat them as observations rather than guarantees.
+So the cold-start cost that looked like a risk from local numbers was real but small at
+these sizes, and nothing forced a redesign. It was linear, though, so the relay was then
+changed to stop rebuilding the document on wake. Measured again on the same documents:
+
+| Elements | Wake-up CPU, before | Wake-up CPU, after | New client full sync, CPU |
+| --- | --- | --- | --- |
+| 20,000 | 35 ms | 1 ms | 6 ms |
+| 50,000 | 79 ms | 1 ms | not measured |
+| 100,000 | 176 ms | 1 ms | 4 ms |
+
+The first write after a wake still rebuilds the document, at the earlier cost, because an
+incoming op is validated against what it references. Skipping that check would make writes
+constant-time too, at the price of accepting ops the relay cannot vouch for.
+
+These are single runs on one account whose plan limits were not separately verified, so
+treat them as observations rather than guarantees.
 
 ## Known limits
 
-- **Cold start is linear in document size.** See the measurements above.
+- **The first write after a wake is linear in document size.** Reads are not. See the
+  measurements above.
+- **The relay is open.** No authentication: anyone with a document's name can read and edit
+  it. The guards limit what one client can cost, not who may connect, and nothing limits how
+  many documents can be created.
+- **A full document is a dead end for the writer that filled it.** Once an insert is refused,
+  that client's later ops are refused too, and its unsent edits stay local.
 - **Hard relay crashes.** Ops that were broadcast but not yet flushed (at most two seconds'
   worth) survive only if their author is still connected to resend them. A local op that
   depended on such a lost op from someone else is dropped during resync.
 - **One writer per replica id.** A second connection with the same replica id replaces the
   first. Two live processes sharing an id would issue conflicting op ids.
-- **Characters, not rich text.** One op per character; no formatting, no cursors, no undo.
+- **Characters, not rich text.** One op per character; no formatting and no undo.
