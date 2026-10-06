@@ -310,6 +310,8 @@ characters are not stored at all. For comparison the JSON form of the same state
   included). If the 10 ms per-invocation CPU budget applies to a cold start, that bounds a
   document at a few thousand elements. This has not been measured on Cloudflare, and local
   workerd does not enforce CPU limits. A lazily loaded or chunked document would lift it.
+  `pnpm --filter @crdt/demo-client measure --url wss://<worker>.workers.dev` builds documents of
+  increasing size on a deployed relay and times the request that wakes each one from storage.
 - **Not deployed.** Everything was verified locally and in CI: unit and property tests, the
   relay tests in workerd, the fuzzers, and (locally only) an end-to-end run of the demo
   client against `wrangler dev`. Nothing has been deployed to a Cloudflare account.

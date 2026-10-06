@@ -58,6 +58,8 @@ export class DocumentDO extends DurableObject<Env> {
   /** True iff this instance has an alarm pending for its own buffer. */
   private alarmScheduled = false;
   private compacting = false;
+  /** Changes whenever the object is constructed afresh; lets a client tell a cold start from a warm request. */
+  private readonly instance = crypto.randomUUID();
   private readonly snapshotEvery: number;
   private readonly logTail: number;
 
@@ -156,6 +158,7 @@ export class DocumentDO extends DurableObject<Env> {
     if (route === "text") return new Response(this.doc.toString());
     if (route === "stats") {
       return Response.json({
+        instance: this.instance,
         seq: this.seq,
         durableSeq: this.durableSeq,
         snapshotSeq: this.snapshotSeq,
