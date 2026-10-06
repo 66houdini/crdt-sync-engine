@@ -8,6 +8,10 @@ than by manual testing.
 
 This is an engine, not a product: no auth, no UI framework, a CLI client and one bare HTML page.
 
+**Live demo:** https://crdt-relay.oladipupoolatunji272.workers.dev — open it in two tabs and
+type in both; use "Go offline" in one, keep typing, then reconnect. It is an open,
+unauthenticated demo on a free plan, so documents are public and may be reset at any time.
+
 ## Highlights
 
 - **Checked against the paper, not against itself.** FugueMax is differentially tested
